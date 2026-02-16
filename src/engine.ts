@@ -1,4 +1,4 @@
-import { compareClocks, type ClockService, type HybridLogicalClock } from "../hlc";
+import type { ClockService, HybridLogicalClock } from "./hlc";
 import type {
   RowStoreAdapter,
   RowStoreInvalidationHint,
@@ -8,9 +8,10 @@ import type {
   RowStoreTxnResult,
   RowStoreWriteResult,
   StoredRow,
-} from "./types";
+  WriteOutcome,
+} from "./row-store/types";
 
-interface CreateRowStoreInput<Value = unknown> {
+interface CreateEngineInput<Value = unknown> {
   adapter: RowStoreAdapter<Value>;
   clock: Pick<ClockService, "nextBatch">;
   txIDFactory?: () => string;
@@ -33,8 +34,14 @@ interface DeleteIntent {
 
 type WriteIntent<Value = unknown> = PutIntent<Value> | DeleteIntent;
 
-export interface RowStore<Value = unknown> {
+export interface ApplyRemoteResult {
+  appliedCount: number;
+  invalidationHints: RowStoreInvalidationHint[];
+}
+
+export interface Engine<Value = unknown> {
   txn(operations: ReadonlyArray<RowStoreOperation<Value>>): Promise<RowStoreTxnResult<Value>>;
+  applyRemote(rows: ReadonlyArray<StoredRow<Value>>): Promise<ApplyRemoteResult>;
   subscribe(listener: RowStoreListener<Value>): () => void;
 }
 
@@ -75,17 +82,71 @@ function uniqueInvalidationHints(
   return unique;
 }
 
-function rowKey(collection: string, id: string): string {
-  return `${collection}::${id}`;
-}
-
 function assertNever(value: never): never {
   throw new Error(`Unsupported operation kind: ${String(value)}`);
 }
 
-export function createRowStore<Value = unknown>(
-  input: CreateRowStoreInput<Value>,
-): RowStore<Value> {
+function outcomesToWritesAndHints(outcomes: ReadonlyArray<WriteOutcome>): {
+  writes: RowStoreWriteResult[];
+  invalidationHints: RowStoreInvalidationHint[];
+} {
+  const writes: RowStoreWriteResult[] = [];
+  const hints: RowStoreInvalidationHint[] = [];
+
+  for (const outcome of outcomes) {
+    if (!outcome.written) {
+      continue;
+    }
+
+    writes.push({
+      collection: outcome.collection,
+      id: outcome.id,
+      parentID: outcome.parentID,
+      hlc: outcome.hlc,
+      tombstone: outcome.tombstone,
+    });
+    hints.push({
+      collection: outcome.collection,
+      id: outcome.id,
+      ...(outcome.parentID ? { parentID: outcome.parentID } : {}),
+    });
+  }
+
+  return { writes, invalidationHints: uniqueInvalidationHints(hints) };
+}
+
+function intentToRow<Value>(
+  intent: WriteIntent<Value>,
+  hlc: HybridLogicalClock,
+  txID: string,
+): StoredRow<Value> {
+  switch (intent.kind) {
+    case "put":
+      return {
+        collection: intent.collection,
+        id: intent.id,
+        parentID: intent.parentID,
+        value: intent.value,
+        hlc,
+        txID,
+        tombstone: false,
+      };
+    case "delete":
+      return {
+        collection: intent.collection,
+        id: intent.id,
+        parentID: intent.parentID,
+        value: null,
+        hlc,
+        txID,
+        tombstone: true,
+      };
+    default:
+      return assertNever(intent);
+  }
+}
+
+export function createEngine<Value = unknown>(input: CreateEngineInput<Value>): Engine<Value> {
   const listeners = new Set<RowStoreListener<Value>>();
   const txIDFactory = input.txIDFactory ?? defaultTxIDFactory;
 
@@ -107,13 +168,30 @@ export function createRowStore<Value = unknown>(
     }
   }
 
-  function notify(result: RowStoreTxnResult<Value>): void {
+  function notifyTxn(result: RowStoreTxnResult<Value>): void {
     if (result.invalidationHints.length === 0) {
       return;
     }
 
     for (const listener of listeners) {
       listener(result);
+    }
+  }
+
+  function notifyRemote(result: ApplyRemoteResult): void {
+    if (result.invalidationHints.length === 0) {
+      return;
+    }
+
+    const asTxnResult: RowStoreTxnResult<Value> = {
+      txID: "",
+      readResults: [],
+      writes: [],
+      invalidationHints: result.invalidationHints,
+    };
+
+    for (const listener of listeners) {
+      listener(asTxnResult);
     }
   }
 
@@ -132,6 +210,8 @@ export function createRowStore<Value = unknown>(
 
       return enqueue(async () => {
         const txID = txIDFactory();
+
+        // Phase 1: Plan — dispatch reads and collect write intents.
         const planned = await input.adapter.txn(async (tx) => {
           const readResults: RowStoreReadResult<Value>[] = [];
           const writeIntents: WriteIntent<Value>[] = [];
@@ -215,10 +295,7 @@ export function createRowStore<Value = unknown>(
             }
           }
 
-          return {
-            readResults,
-            writeIntents,
-          };
+          return { readResults, writeIntents };
         });
 
         if (planned.writeIntents.length === 0) {
@@ -230,102 +307,18 @@ export function createRowStore<Value = unknown>(
           };
         }
 
-        const clocks: HybridLogicalClock[] = await input.clock.nextBatch(
-          planned.writeIntents.length,
+        // Phase 2: Allocate HLCs outside any adapter transaction.
+        const clocks = await input.clock.nextBatch(planned.writeIntents.length);
+
+        // Phase 3: Build StoredRows and apply with conflict resolution.
+        const rows: StoredRow<Value>[] = planned.writeIntents.map((intent, i) =>
+          intentToRow(intent, clocks[i]!, txID),
         );
 
-        const applied = await input.adapter.txn(async (tx) => {
-          const stagedRows = new Map<string, StoredRow<Value>>();
-          const writes: RowStoreWriteResult[] = [];
-          const invalidationHints: RowStoreInvalidationHint[] = [];
+        const outcomes = await input.adapter.txn(async (tx) => tx.applyRows(rows));
+        const { writes, invalidationHints } = outcomesToWritesAndHints(outcomes);
 
-          for (let index = 0; index < planned.writeIntents.length; index += 1) {
-            const intent = planned.writeIntents[index]!;
-            const hlc = clocks[index]!;
-            if (!hlc) {
-              throw new Error("Missing HLC for write intent");
-            }
-
-            let row: StoredRow<Value>;
-            let write: RowStoreWriteResult;
-            let invalidationHint: RowStoreInvalidationHint;
-
-            switch (intent.kind) {
-              case "put": {
-                row = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  parentID: intent.parentID,
-                  value: intent.value,
-                  hlc,
-                  txID,
-                  tombstone: false,
-                };
-                write = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  parentID: intent.parentID,
-                  hlc,
-                  tombstone: false,
-                };
-                invalidationHint = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  ...(intent.parentID ? { parentID: intent.parentID } : {}),
-                };
-                break;
-              }
-              case "delete": {
-                row = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  parentID: intent.parentID,
-                  value: null,
-                  hlc,
-                  txID,
-                  tombstone: true,
-                };
-                write = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  parentID: intent.parentID,
-                  hlc,
-                  tombstone: true,
-                };
-                invalidationHint = {
-                  collection: intent.collection,
-                  id: intent.id,
-                  ...(intent.parentID ? { parentID: intent.parentID } : {}),
-                };
-                break;
-              }
-              default: {
-                assertNever(intent);
-              }
-            }
-
-            const key = rowKey(row.collection, row.id);
-            const existing = stagedRows.get(key) ?? (await tx.get(row.collection, row.id));
-            if (existing && compareClocks(row.hlc, existing.hlc) !== 1) {
-              continue;
-            }
-
-            stagedRows.set(key, row);
-            writes.push(write);
-            invalidationHints.push(invalidationHint);
-          }
-
-          if (stagedRows.size > 0) {
-            await tx.bulkPut([...stagedRows.values()]);
-          }
-
-          return {
-            writes,
-            invalidationHints,
-          };
-        });
-
-        if (applied.writes.length === 0) {
+        if (writes.length === 0) {
           return {
             txID,
             readResults: planned.readResults,
@@ -334,14 +327,33 @@ export function createRowStore<Value = unknown>(
           };
         }
 
-        const result = {
+        const result: RowStoreTxnResult<Value> = {
           txID,
           readResults: planned.readResults,
-          writes: applied.writes,
-          invalidationHints: uniqueInvalidationHints(applied.invalidationHints),
+          writes,
+          invalidationHints,
         };
 
-        notify(result);
+        notifyTxn(result);
+        return result;
+      });
+    },
+
+    async applyRemote(rows: ReadonlyArray<StoredRow<Value>>): Promise<ApplyRemoteResult> {
+      if (rows.length === 0) {
+        return { appliedCount: 0, invalidationHints: [] };
+      }
+
+      return enqueue(async () => {
+        const outcomes = await input.adapter.txn(async (tx) => tx.applyRows([...rows]));
+        const { writes, invalidationHints } = outcomesToWritesAndHints(outcomes);
+
+        const result: ApplyRemoteResult = {
+          appliedCount: writes.length,
+          invalidationHints,
+        };
+
+        notifyRemote(result);
         return result;
       });
     },

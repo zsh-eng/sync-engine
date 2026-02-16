@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { IDBKeyRange, indexedDB } from "fake-indexeddb";
 
+import { createEngine } from "../engine";
 import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "../hlc";
 import { createIndexedDbRowStoreAdapter } from "./indexeddb-adapter";
-import { createRowStore } from "./row-store";
 
 interface RowValue {
   title: string;
 }
 
-function createIndexedDbRowStore() {
+function createIndexedDbEngine() {
   const dbName = `row-store-test-${crypto.randomUUID()}`;
   let storedClock: HybridLogicalClock | undefined;
   let txCounter = 0;
@@ -32,7 +32,7 @@ function createIndexedDbRowStore() {
     indexedDB,
     IDBKeyRange,
   });
-  const rowStore = createRowStore<RowValue>({
+  const engine = createEngine<RowValue>({
     adapter,
     clock,
     txIDFactory: () => `tx_${++txCounter}`,
@@ -40,7 +40,7 @@ function createIndexedDbRowStore() {
 
   return {
     adapter,
-    rowStore,
+    engine,
     cleanup: async () => {
       await adapter.deleteDatabase();
     },
@@ -48,17 +48,17 @@ function createIndexedDbRowStore() {
 }
 
 describe("IndexedDbRowStoreAdapter", () => {
-  test("stores and reads rows through RowStore", async () => {
-    const { adapter, rowStore, cleanup } = createIndexedDbRowStore();
+  test("stores and reads rows through Engine", async () => {
+    const { adapter, engine, cleanup } = createIndexedDbEngine();
 
     try {
-      const write = await rowStore.txn([
+      const write = await engine.txn([
         { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
       ]);
 
       expect(write.writes[0]?.hlc).toBe("2000-0-deviceA");
 
-      const read = await rowStore.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
       expect(read.readResults[0]).toEqual({
         opIndex: 0,
         kind: "get",
@@ -73,7 +73,7 @@ describe("IndexedDbRowStoreAdapter", () => {
         },
       });
 
-      await rowStore.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
+      await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
 
       const raw = await adapter.getRawRow("books", "book-1");
       expect(raw).toMatchObject({
@@ -83,7 +83,7 @@ describe("IndexedDbRowStoreAdapter", () => {
         tombstone: 1,
       });
 
-      const deleted = await rowStore.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+      const deleted = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
       expect(deleted.readResults[0]).toEqual({
         opIndex: 0,
         kind: "get",
@@ -95,10 +95,10 @@ describe("IndexedDbRowStoreAdapter", () => {
   });
 
   test("delete_all_with_parent only tombstones matching children", async () => {
-    const { adapter, rowStore, cleanup } = createIndexedDbRowStore();
+    const { adapter, engine, cleanup } = createIndexedDbEngine();
 
     try {
-      await rowStore.txn([
+      await engine.txn([
         {
           kind: "put",
           collection: "highlights",
@@ -122,7 +122,7 @@ describe("IndexedDbRowStoreAdapter", () => {
         },
       ]);
 
-      const deleteResult = await rowStore.txn([
+      const deleteResult = await engine.txn([
         {
           kind: "delete_all_with_parent",
           collection: "highlights",
@@ -147,7 +147,7 @@ describe("IndexedDbRowStoreAdapter", () => {
         },
       ]);
 
-      const bookOneChildren = await rowStore.txn([
+      const bookOneChildren = await engine.txn([
         {
           kind: "get_all_with_parent",
           collection: "highlights",
@@ -160,7 +160,7 @@ describe("IndexedDbRowStoreAdapter", () => {
         rows: [],
       });
 
-      const bookTwoChildren = await rowStore.txn([
+      const bookTwoChildren = await engine.txn([
         {
           kind: "get_all_with_parent",
           collection: "highlights",

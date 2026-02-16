@@ -81,11 +81,20 @@ export interface RowStoreTxnResult<Value = unknown> {
   invalidationHints: RowStoreInvalidationHint[];
 }
 
+export interface WriteOutcome {
+  written: boolean;
+  collection: string;
+  id: string;
+  parentID: string | null;
+  hlc: HybridLogicalClock;
+  tombstone: boolean;
+}
+
 export interface RowStoreAdapterTransaction<Value = unknown> {
   getAll(collection: string): Promise<StoredRow<Value>[]>;
   get(collection: string, id: string): Promise<StoredRow<Value> | undefined>;
   getAllWithParent(collection: string, parentID: string): Promise<StoredRow<Value>[]>;
-  bulkPut(rows: StoredRow<Value>[]): Promise<void>;
+  applyRows(rows: StoredRow<Value>[]): Promise<WriteOutcome[]>;
 }
 
 export interface RowStoreAdapter<Value = unknown> {

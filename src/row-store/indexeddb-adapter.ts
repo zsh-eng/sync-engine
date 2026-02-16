@@ -1,7 +1,7 @@
 import Dexie, { type Table } from "dexie";
 
-import { formatClock, parseClock } from "../hlc";
-import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow } from "./types";
+import { compareClocks, formatClock, parseClock } from "../hlc";
+import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow, WriteOutcome } from "./types";
 
 export interface IndexedDbRowRecord<Value = unknown> {
   collection: string;
@@ -105,12 +105,47 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
             .toArray();
           return rows.map((row) => toStoredRow(row));
         },
-        bulkPut: async (rows) => {
+        applyRows: async (rows) => {
           if (rows.length === 0) {
-            return;
+            return [];
           }
 
-          await this.db.rows.bulkPut(rows.map((row) => toIndexedDbRow(row)));
+          // Single round-trip to fetch all existing rows.
+          const keys: [string, string][] = rows.map((r) => [r.collection, r.id]);
+          const existingRecords = await this.db.rows.bulkGet(keys);
+          const existingByKey = new Map<string, StoredRow<Value>>();
+          for (let i = 0; i < rows.length; i++) {
+            const record = existingRecords[i];
+            if (record) {
+              existingByKey.set(`${record.collection}::${record.id}`, toStoredRow(record));
+            }
+          }
+
+          const winners = new Map<string, StoredRow<Value>>();
+          const outcomes: WriteOutcome[] = [];
+
+          for (const row of rows) {
+            const key = `${row.collection}::${row.id}`;
+            const existing = winners.get(key) ?? existingByKey.get(key);
+            const written = !existing || compareClocks(row.hlc, existing.hlc) === 1;
+            if (written) {
+              winners.set(key, row);
+            }
+            outcomes.push({
+              written,
+              collection: row.collection,
+              id: row.id,
+              parentID: row.parentID,
+              hlc: row.hlc,
+              tombstone: row.tombstone,
+            });
+          }
+
+          if (winners.size > 0) {
+            await this.db.rows.bulkPut([...winners.values()].map((r) => toIndexedDbRow(r)));
+          }
+
+          return outcomes;
         },
       });
     });

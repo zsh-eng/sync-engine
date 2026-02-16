@@ -1,4 +1,5 @@
-import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow } from "./types";
+import { compareClocks } from "../hlc";
+import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow, WriteOutcome } from "./types";
 
 function rowKey(collection: string, id: string): string {
   return `${collection}::${id}`;
@@ -66,10 +67,25 @@ export class InMemoryRowStoreAdapter<Value = unknown> implements RowStoreAdapter
         }
         return rows;
       },
-      bulkPut: async (rows) => {
+      applyRows: async (rows) => {
+        const outcomes: WriteOutcome[] = [];
         for (const row of rows) {
-          workingRows.set(rowKey(row.collection, row.id), cloneRow(row));
+          const key = rowKey(row.collection, row.id);
+          const existing = workingRows.get(key);
+          const written = !existing || compareClocks(row.hlc, existing.hlc) === 1;
+          if (written) {
+            workingRows.set(key, cloneRow(row));
+          }
+          outcomes.push({
+            written,
+            collection: row.collection,
+            id: row.id,
+            parentID: row.parentID,
+            hlc: row.hlc,
+            tombstone: row.tombstone,
+          });
         }
+        return outcomes;
       },
     };
 
