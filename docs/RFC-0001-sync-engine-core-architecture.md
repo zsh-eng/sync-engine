@@ -79,35 +79,47 @@ Existing systems often optimize for broader problem spaces than needed here (fed
 
 ### 7.1 Architecture Overview
 
-The architecture uses a shared session layer and two independent data sync planes.
+The architecture uses a shared runtime/session layer and namespace-scoped sync engines.
 
 ```mermaid
 flowchart LR
-  A["App Runtime"] --> B["Local Row Store"]
-  A --> C["Local File Cache + Manifest (post-v1)"]
-  A --> D["Sync Coordinator"]
-  D --> E["ConnectionManager + AuthLayer"]
-  D --> F["Transport Adapter"]
-  F --> G["Sync API"]
-  G --> H["Row State (Bag of Rows)"]
-  G --> I["Blob Store"]
+  A["App Runtime"] --> B["SyncRuntime (shared)"]
+  B --> C["ConnectionManager + AuthLayer"]
+  B --> D["Transport Adapter"]
+  A --> E["NamespaceSyncEngine (books-app)"]
+  A --> F["NamespaceSyncEngine (tasks-app)"]
+  E --> G["Local Row Store (books-app)"]
+  F --> H["Local Row Store (tasks-app)"]
+  E --> D
+  F --> D
+  D --> I["Sync API"]
+  I --> J["Row State (Bag of Rows)"]
+  I --> K["Blob Store (post-v1)"]
 ```
 
 ### 7.2 Module Boundaries
 
-| Module            | Responsibility                                          | Inputs                                         | Outputs                         |
-| ----------------- | ------------------------------------------------------- | ---------------------------------------------- | ------------------------------- |
-| ConnectionManager | Connection state machine, retry, pause/resume           | transport errors, visibility, connect requests | current connection state        |
-| AuthLayer         | Token lifecycle and session pinning                     | token updates, auth errors                     | validated auth context          |
-| TransportAdapter  | HTTP/WebSocket abstraction                              | sync requests                                  | protocol frames/responses       |
-| RowSyncEngine     | Push/pull rows, merge conflicts, apply tombstones       | local ops, remote changes                      | local row state + cursor token  |
-| FileSyncEngine    | Upload/download blobs, maintain file manifest (post-v1) | file intents, row references                   | local file availability         |
-| SyncCoordinator   | Ordering and orchestration across planes                | app events, connection state                   | bounded work queues and retries |
-| Inspector API     | Debugging and observability                             | local state, queue metadata                    | tooling endpoints/views         |
+| Module              | Responsibility                                                                | Inputs                                               | Outputs                                 |
+| ------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------- |
+| SyncRuntime         | Shared connection/auth/transport lifecycle for all active namespaces          | app lifecycle, auth updates, connectivity signals    | runtime connection state + transport IO |
+| ConnectionManager   | Connection state machine, retry, pause/resume                                 | transport errors, visibility, connect requests       | current connection state                |
+| AuthLayer           | Token lifecycle and session pinning                                           | token updates, auth errors                           | validated auth context                  |
+| TransportAdapter    | HTTP/WebSocket abstraction                                                    | sync requests                                        | protocol frames/responses               |
+| NamespaceSyncEngine | Push/pull rows for one namespace, own cursor/op-queue, merge conflicts, apply | local ops, runtime state, remote changes             | local row state + namespace cursor      |
+| RowStore            | Local transactional reads/writes, tombstone materialization, changefeed hints | row operations, HLC service                          | query results + invalidation hints      |
+| FileSyncEngine      | Upload/download blobs, maintain file manifest (post-v1)                       | file intents, row references                         | local file availability                 |
+| Inspector API       | Debugging and observability                                                   | local state, queue metadata, pull/push trace summary | tooling endpoints/views                 |
 
 ### 7.3 Separation Principle
 
-Session and auth code must be reusable regardless of what data plane is synced. Row and file engines should consume connection/auth state, not own it.
+Session and auth code must be reusable regardless of what data plane or namespace is synced. Namespace engines consume runtime state and transport; they do not own auth/session primitives.
+
+### 7.4 Namespace Topology
+
+- Single-namespace apps should instantiate one `NamespaceSyncEngine` and expose namespace-free repositories/hooks to app code.
+- Multi-namespace apps (for example cross-app viewers/admin tools) can instantiate one engine per active namespace and compose results at the app layer.
+- Namespace fanout should be explicit and bounded; avoid hidden per-view engine creation.
+- Durable state (cursor/op-queue/retry markers) is per namespace; transport connection state is shared.
 
 ## 8. Data Model
 
@@ -368,11 +380,56 @@ Client hard delete is not exposed in v1.
 - Pull emits resulting row changes ordered by `(serverTimestampMs, collection, id)`.
 - Cross-request distributed transactions are out of scope in v1.
 
+### 12.1 Local RowStore Transaction Contract
+
+`RowStore` exposes a single transactional entrypoint:
+
+```ts
+type RowStoreOperation =
+  | { kind: "get_all"; collection: string }
+  | { kind: "get"; collection: string; id: string }
+  | { kind: "get_all_with_parent"; collection: string; parentID: string }
+  | { kind: "put"; collection: string; id: string; value: unknown; parentID?: string | null }
+  | { kind: "delete"; collection: string; id: string }
+  | { kind: "delete_all_with_parent"; collection: string; parentID: string };
+
+type RowStoreReadResult =
+  | { opIndex: number; kind: "get_all"; rows: StoredRow[] }
+  | { opIndex: number; kind: "get"; row?: StoredRow }
+  | { opIndex: number; kind: "get_all_with_parent"; rows: StoredRow[] };
+
+interface RowStoreTxnResult {
+  txID: string;
+  readResults: RowStoreReadResult[];
+  writes: Array<{
+    collection: string;
+    id: string;
+    hlc: HybridLogicalClock;
+    tombstone: boolean;
+  }>;
+  invalidationHints: Array<{
+    collection: string;
+    id?: string;
+    parentID?: string;
+  }>;
+  enqueuedMutationIDs: string[];
+}
+```
+
+Execution rules:
+
+- Run all operations in one local DB transaction.
+- Resolve set-based writes (for example `delete_all_with_parent`) to concrete row IDs within the same transaction.
+- Allocate HLC values once per transaction using `nextBatch(writeCount)`, then assign clocks to writes in deterministic operation order.
+- For delete operations, write tombstones rather than hard delete.
+- Storage adapters control physical tombstone encoding (for example `1/0` in Dexie for index-friendly fields).
+- Apply row writes + enqueue op-log entries + publish invalidation hints atomically.
+
 ## 13. Local Storage Strategy
 
 ### 13.1 Adapter Interfaces
 
-- `RowStoreAdapter`: put/get/scan/index by `(namespace, collection, id)`.
+- `RowStoreAdapter`: transactional operation executor + changefeed/invalidation hints over `(namespace, collection, id)`.
 - `OpLogAdapter`: append/pending mutation tracking.
 - `SyncStateAdapter`: durable replication state (global cursor token, local HLC state, retry/backoff state, ack markers).
 - `FileStoreAdapter`: local blob cache + metadata manifest (post-v1).
@@ -387,6 +444,14 @@ V1 on web:
 - One canonical `sync_state` store (durable cursor token and engine state).
 - Inline metadata in `rows` avoids join-like reads across stores and reduces drift risk.
 - Keep write-path consistency by applying row change + op_log enqueue + invalidation in one local transaction.
+- Do not add a separate "synced vs unsynced rows" table in v1.
+
+### 13.3 Dirty Flag And Mutation Tracking
+
+- `op_log` is the source of truth for pending/outstanding sync work.
+- `dirty` may exist as a derived optimization hint on rows but must not replace `op_log`.
+- Why: `op_log` preserves ordering, retries, idempotency keys, and crash-safe recovery semantics.
+- If `dirty` is used, it should be set/cleared only by transaction code that also updates `op_log`.
 
 Future:
 
@@ -463,7 +528,9 @@ Future option:
 
 ### 14.5 React Query Invalidation Mapping
 
-- Engine provides a default key mapping (`[collection]`) and supports custom key mappers.
+- RowStore owns invalidation event emission through a local changefeed.
+- `NamespaceSyncEngine` and generated repositories both write through `RowStore.txn`, so local and remote applies share one invalidation path.
+- React integration provides default key mapping (`[collection]`) and supports custom key mappers.
 - Invalidation events are coalesced per microtask tick to avoid N invalidations for one transaction.
 - This removes per-hook optimistic/invalidation boilerplate; hooks only call repository methods and subscribe to query keys.
 
@@ -472,6 +539,13 @@ Future option:
 - `parentID` is intended for one-to-many targeting (for example `highlights` by `bookID`).
 - It is a sync fetch hint, not a full relational query language.
 - Collections without one-to-many access patterns can omit `parentID`.
+
+### 14.7 Composing Relational Views In Hooks
+
+- `useSyncQuery` should focus on primitive reads (`get_all`, `get`, `get_all_with_parent`).
+- Joins/compositions should be built as app-level custom hooks by combining multiple `useSyncQuery` calls.
+- Example: a `useBookWithHighlights(bookID)` hook composes one book query and one highlights-by-parent query, then returns merged view data.
+- Because invalidation is driven by RowStore changefeed hints, updates to either side re-run the composed hook.
 
 ## 15. Security And Privacy
 
@@ -502,6 +576,21 @@ Provide a local inspector surface for:
 - current cursor window (`sinceTsMs`, `upperBoundTsMs`) for active pulls
 - accelerator pull activity (collection and optional parent filters)
 - file manifest status (post-v1)
+
+### 16.3 Logging Policy
+
+Default production logs (always on):
+
+- push/pull summaries: namespace, request/response counts, latency, retry reason, error class
+- cursor progress summaries: previous/next cursor tokens (opaque), pull window metadata, has-more loops
+- queue health: op-log depth, oldest pending age, backoff state
+- apply summaries: collection and row IDs changed, tombstone counts
+
+Debug logs (opt-in only):
+
+- redacted payload snapshots for push/pull and apply
+- bounded local ring buffer for recent traces to support bug reports
+- explicit scrub rules for secret and sensitive fields
 
 ## 17. Performance And Cost
 
@@ -601,22 +690,29 @@ Exit criteria:
 | Q5  | Do we need a first-party `useLiveQuery` in v1?                               | <tbd> | 2026-02-16  | React Query invalidation ergonomics       | Resolved: no                  |
 | Q6  | Should the cursor token remain opaque forever or expose a typed debug shape? | <tbd> | 2026-03-10  | debugging ergonomics vs API stability     | Open                          |
 | Q7  | Should parent filters be schema-generated or manually declared?              | <tbd> | 2026-03-25  | correctness vs developer control          | Open                          |
+| Q8  | Should a row-level `dirty` flag replace `op_log` as pending-sync truth?      | <tbd> | 2026-02-16  | crash recovery and retry correctness      | Resolved: no                  |
+| Q9  | Should invalidation ownership live in SyncEngine or RowStore?                | <tbd> | 2026-02-16  | single-path consistency for local/remote  | Resolved: RowStore            |
+| Q10 | Should each namespace have an isolated sync engine instance?                 | <tbd> | 2026-02-16  | app ergonomics vs state complexity        | Resolved: yes                 |
 
 ## 23. Decision Log
 
-| Date       | Decision                                                               | Rationale                                                                      | Consequence                                                  |
-| ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------ |
-| 2026-02-15 | Two-plane architecture (rows + files)                                  | Matches data shape and performance needs                                       | Independent evolution of structured and blob sync            |
-| 2026-02-15 | Session layer is separate from data layer                              | Better reuse and testability                                                   | Cleaner boundaries and simpler testing                       |
-| 2026-02-15 | LWW with HLC default                                                   | Predictable, low complexity conflict model                                     | Some collaborative text scenarios need future CRDT extension |
-| 2026-02-15 | Tombstone-first deletes                                                | Required for convergence and safe GC                                           | Additional storage and compaction complexity                 |
-| 2026-02-15 | HTTP correctness path, socket optional                                 | Serverless compatibility                                                       | Slightly higher pull latency without push channel            |
-| 2026-02-15 | React Query integration first                                          | Fast adoption and familiar tooling                                             | Need invalidation discipline                                 |
-| 2026-02-16 | Row sync prioritized for v1; files deferred                            | Reduces scope and de-risks initial release                                     | Faster path to stable core protocol                          |
-| 2026-02-16 | One durable server-issued cursor token with filtered accelerator pulls | Preserves simple durable state while enabling priority sync paths              | Replayed rows can increase apply volume                      |
-| 2026-02-16 | Hook-first strict API boundary                                         | Prevents invalid local writes and repeated optimistic/invalidation boilerplate | Direct local DB querying is intentionally constrained        |
-| 2026-02-16 | Inline internal metadata in canonical rows store                       | Avoids row/meta drift and join-like local reads                                | Slightly larger row payload in local storage                 |
-| 2026-02-16 | Cursor ordering uses `(serverTimestampMs, collection, id)`             | Deterministic pagination without separate commit sequence                      | Requires stable index and server-issued cursor tokens        |
+| Date       | Decision                                                                | Rationale                                                                       | Consequence                                                  |
+| ---------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| 2026-02-15 | Two-plane architecture (rows + files)                                   | Matches data shape and performance needs                                        | Independent evolution of structured and blob sync            |
+| 2026-02-15 | Session layer is separate from data layer                               | Better reuse and testability                                                    | Cleaner boundaries and simpler testing                       |
+| 2026-02-15 | LWW with HLC default                                                    | Predictable, low complexity conflict model                                      | Some collaborative text scenarios need future CRDT extension |
+| 2026-02-15 | Tombstone-first deletes                                                 | Required for convergence and safe GC                                            | Additional storage and compaction complexity                 |
+| 2026-02-15 | HTTP correctness path, socket optional                                  | Serverless compatibility                                                        | Slightly higher pull latency without push channel            |
+| 2026-02-15 | React Query integration first                                           | Fast adoption and familiar tooling                                              | Need invalidation discipline                                 |
+| 2026-02-16 | Row sync prioritized for v1; files deferred                             | Reduces scope and de-risks initial release                                      | Faster path to stable core protocol                          |
+| 2026-02-16 | One durable server-issued cursor token with filtered accelerator pulls  | Preserves simple durable state while enabling priority sync paths               | Replayed rows can increase apply volume                      |
+| 2026-02-16 | Hook-first strict API boundary                                          | Prevents invalid local writes and repeated optimistic/invalidation boilerplate  | Direct local DB querying is intentionally constrained        |
+| 2026-02-16 | Inline internal metadata in canonical rows store                        | Avoids row/meta drift and join-like local reads                                 | Slightly larger row payload in local storage                 |
+| 2026-02-16 | Cursor ordering uses `(serverTimestampMs, collection, id)`              | Deterministic pagination without separate commit sequence                       | Requires stable index and server-issued cursor tokens        |
+| 2026-02-16 | Shared `SyncRuntime` + per-namespace `NamespaceSyncEngine`              | Keeps app APIs namespace-light while preserving isolation of durable sync state | Multi-namespace apps compose engines explicitly              |
+| 2026-02-16 | `op_log` remains authoritative; `dirty` is optional derived hint        | Guarantees ordering/retry/idempotency and crash-safe replay semantics           | Slightly more local metadata than a `dirty`-only approach    |
+| 2026-02-16 | RowStore owns invalidation via changefeed hints                         | Unifies local writes and remote apply invalidation semantics                    | Hooks depend on RowStore event contract                      |
+| 2026-02-16 | RowStore `txn` accepts discriminated union ops and returns typed result | Single write path with deterministic HLC assignment and clear invalidation map  | Adapter implementations must support set-op expansion        |
 
 ## 24. Appendix A: Initial Defaults
 
@@ -629,3 +725,6 @@ Exit criteria:
 - Cursor model: one durable server-issued global cursor token plus non-durable filtered accelerator pulls.
 - Pull ordering: `(serverTimestampMs, collection, id)` with timestamp window upper bounds.
 - Transactions: atomic per push request.
+- Runtime topology: one shared `SyncRuntime` with per-namespace sync engines.
+- Local mutation tracking: authoritative `op_log`; optional derived `dirty` hint only.
+- Invalidation: emitted by RowStore changefeed hints, consumed by hook/query integration.
