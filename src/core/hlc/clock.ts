@@ -47,7 +47,9 @@ export function parseClock(clock: HybridLogicalClock): ParsedClock {
     throw new Error(`Invalid HLC format: ${clock}`);
   }
 
-  const [wallMsRaw, counterRaw, nodeId] = parts;
+  const wallMsRaw = parts[0]!;
+  const counterRaw = parts[1]!;
+  const nodeId = parts[2]!;
   const wallMs = Number(wallMsRaw);
   const counter = Number(counterRaw);
 

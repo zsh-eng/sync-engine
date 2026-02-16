@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-    createConnectionManager,
-    deriveSyncAbility,
-    type ConnectionManager,
+  createConnectionManager,
+  deriveSyncAbility,
+  type ConnectionManager,
 } from "./connection-manager";
 import type { ConnectionState } from "./types";
 
@@ -331,9 +331,9 @@ describe("deriveSyncAbility", () => {
     expect(
       deriveSyncAbility({ network: "online", auth: "unauthenticated", visibility: "hidden" }),
     ).toBe("needs-auth");
-    expect(
-      deriveSyncAbility({ network: "online", auth: "expired", visibility: "hidden" }),
-    ).toBe("needs-auth");
+    expect(deriveSyncAbility({ network: "online", auth: "expired", visibility: "hidden" })).toBe(
+      "needs-auth",
+    );
   });
 
   test("paused when hidden but otherwise ready", () => {

@@ -1,12 +1,12 @@
 import type {
-    AuthStatus,
-    BackoffConfig,
-    BackoffState,
-    ConnectionState,
-    ConnectionStateListener,
-    NetworkStatus,
-    SyncAbility,
-    VisibilityStatus,
+  AuthStatus,
+  BackoffConfig,
+  BackoffState,
+  ConnectionState,
+  ConnectionStateListener,
+  NetworkStatus,
+  SyncAbility,
+  VisibilityStatus,
 } from "./types";
 
 const DEFAULT_BACKOFF: BackoffConfig = {
@@ -120,8 +120,7 @@ export function createConnectionManager(
     recordFailure() {
       const failures = backoff.consecutiveFailures + 1;
       const delayMs = Math.min(
-        backoffConfig.baseMs *
-          Math.pow(backoffConfig.multiplier, failures - 1),
+        backoffConfig.baseMs * Math.pow(backoffConfig.multiplier, failures - 1),
         backoffConfig.maxMs,
       );
       const jitter = delayMs * 0.25 * (Math.random() * 2 - 1);

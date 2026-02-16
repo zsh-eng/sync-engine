@@ -330,9 +330,7 @@ describe("Engine core behavior", () => {
       seedRows: [existingRow],
     });
 
-    const deleteResult = await engine.txn([
-      { kind: "delete", collection: "books", id: "book-1" },
-    ]);
+    const deleteResult = await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
 
     expect(deleteResult.writes).toEqual([]);
     expect(deleteResult.invalidationHints).toEqual([]);

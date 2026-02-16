@@ -12,7 +12,7 @@ export interface BrowserBindingsInput {
  * Returns a cleanup function that removes all event listeners.
  */
 export function bindBrowserEvents(input: BrowserBindingsInput): () => void {
-  const win = input.window ?? globalThis.window;
+  const win = input.window ?? window;
   const { manager } = input;
 
   const handleOnline = () => manager.setOnline();

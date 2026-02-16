@@ -13,4 +13,3 @@ export type {
   MaybePromise,
 } from "./service";
 export { createClockService } from "./service";
-

@@ -18,7 +18,7 @@ function asClock(value: string): HybridLogicalClock {
 describe("HLC stateless functions", () => {
   test("format/parse roundtrip", () => {
     const clock = formatClock({ wallMs: 100, counter: 2, nodeId: "nodeA" });
-    expect(clock).toBe("100-2-nodeA");
+    expect(clock).toBe(asClock("100-2-nodeA"));
     expect(parseClock(clock)).toEqual({ wallMs: 100, counter: 2, nodeId: "nodeA" });
   });
 
@@ -35,7 +35,7 @@ describe("HLC stateless functions", () => {
 
   test("nextClock starts from now with counter zero", () => {
     const clock = nextClock({ nodeId: "local", nowMs: 50 });
-    expect(clock).toBe("50-0-local");
+    expect(clock).toBe(asClock("50-0-local"));
   });
 
   test("nextClock increments counter on same wall time", () => {
@@ -45,7 +45,7 @@ describe("HLC stateless functions", () => {
       nowMs: 50,
     });
 
-    expect(clock).toBe("50-4-local");
+    expect(clock).toBe(asClock("50-4-local"));
   });
 
   test("nextClock increments counter when local wall is ahead of now", () => {
@@ -55,7 +55,7 @@ describe("HLC stateless functions", () => {
       nowMs: 60,
     });
 
-    expect(clock).toBe("70-3-local");
+    expect(clock).toBe(asClock("70-3-local"));
   });
 
   test("nextClock resets counter when physical clock moves forward", () => {

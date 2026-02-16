@@ -1,7 +1,12 @@
 import Dexie, { type Table } from "dexie";
 
 import { compareClocks, formatClock, parseClock } from "../../core/hlc";
-import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow, WriteOutcome } from "../../core/storage/types";
+import type {
+  RowStoreAdapter,
+  RowStoreAdapterTransaction,
+  StoredRow,
+  WriteOutcome,
+} from "../../core/storage/types";
 
 export interface IndexedDbRowRecord<Value = unknown> {
   collection: string;

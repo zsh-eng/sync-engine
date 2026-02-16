@@ -35,7 +35,4 @@ export interface BackoffState {
 }
 
 /** Listener invoked when connection state changes. Receives current and previous state. */
-export type ConnectionStateListener = (
-  state: ConnectionState,
-  previous: ConnectionState,
-) => void;
+export type ConnectionStateListener = (state: ConnectionState, previous: ConnectionState) => void;
