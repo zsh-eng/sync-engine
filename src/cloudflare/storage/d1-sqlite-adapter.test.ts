@@ -1,0 +1,270 @@
+import { Database } from "bun:sqlite";
+import { describe, expect, test } from "bun:test";
+
+import { createEngine } from "../../core/engine";
+import {
+  createClockService,
+  type ClockStorageAdapter,
+  type HybridLogicalClock,
+} from "../../core/hlc";
+import type { D1DatabaseLike, D1PreparedStatementLike, D1ResultLike } from "./d1-sqlite-adapter";
+import { createD1SqliteRowStoreAdapter } from "./d1-sqlite-adapter";
+
+interface RowValue {
+  title: string;
+}
+
+function asClock(value: string): HybridLogicalClock {
+  return value as HybridLogicalClock;
+}
+
+type SqliteBindValue = string | number | bigint | boolean | Uint8Array | null;
+
+function toSqliteBindValues(params: ReadonlyArray<unknown>): SqliteBindValue[] {
+  return [...params] as SqliteBindValue[];
+}
+
+function statementReturnsRows(sql: string): boolean {
+  return /^\s*(SELECT|WITH)\b/i.test(sql) || /\bRETURNING\b/i.test(sql);
+}
+
+interface ExecutablePreparedStatement extends D1PreparedStatementLike {
+  execute<Row>(): D1ResultLike<Row>;
+}
+
+class FakeD1PreparedStatement implements ExecutablePreparedStatement {
+  constructor(
+    private readonly database: Database,
+    private readonly sql: string,
+    private readonly params: ReadonlyArray<unknown> = [],
+  ) {}
+
+  bind(...values: unknown[]): D1PreparedStatementLike {
+    return new FakeD1PreparedStatement(this.database, this.sql, values);
+  }
+
+  execute<Row>(): D1ResultLike<Row> {
+    const query = this.database.query(this.sql);
+    const params = toSqliteBindValues(this.params);
+
+    if (statementReturnsRows(this.sql)) {
+      return {
+        results: query.all(...params) as Row[],
+      };
+    }
+
+    query.run(...params);
+    return { results: [] };
+  }
+}
+
+class FakeD1Database implements D1DatabaseLike {
+  readonly batchSizes: number[] = [];
+  private readonly database: Database;
+
+  constructor() {
+    this.database = new Database(":memory:");
+  }
+
+  prepare(sql: string): D1PreparedStatementLike {
+    return new FakeD1PreparedStatement(this.database, sql);
+  }
+
+  async batch<Row = unknown>(
+    statements: ReadonlyArray<D1PreparedStatementLike>,
+  ): Promise<ReadonlyArray<D1ResultLike<Row>>> {
+    this.batchSizes.push(statements.length);
+    return statements.map((statement) => (statement as ExecutablePreparedStatement).execute<Row>());
+  }
+
+  close(): void {
+    this.database.close(false);
+  }
+}
+
+function createD1SqliteEngine() {
+  let storedClock: HybridLogicalClock | undefined;
+  let txCounter = 0;
+
+  const clockStorage: ClockStorageAdapter = {
+    read: () => storedClock,
+    write: (clock) => {
+      storedClock = clock;
+    },
+  };
+
+  const clock = createClockService({
+    nodeId: "deviceA",
+    storage: clockStorage,
+    now: () => 3_000,
+  });
+
+  const database = new FakeD1Database();
+  const adapter = createD1SqliteRowStoreAdapter<RowValue>({
+    database,
+  });
+  const engine = createEngine<RowValue>({
+    adapter,
+    clock,
+    txIDFactory: () => `tx_${++txCounter}`,
+  });
+
+  return {
+    adapter,
+    database,
+    engine,
+    cleanup: () => {
+      database.close();
+    },
+  };
+}
+
+describe("D1SqliteRowStoreAdapter", () => {
+  test("reports write outcomes when the same row is updated twice in one txn", async () => {
+    const { engine, cleanup } = createD1SqliteEngine();
+
+    try {
+      const writeResult = await engine.txn([
+        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
+        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune Messiah" } },
+      ]);
+
+      expect(writeResult.writes).toEqual([
+        {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          hlc: asClock("3000-0-deviceA"),
+          tombstone: false,
+        },
+        {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          hlc: asClock("3000-1-deviceA"),
+          tombstone: false,
+        },
+      ]);
+
+      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+      expect(read.readResults[0]).toEqual({
+        opIndex: 0,
+        kind: "get",
+        row: {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "Dune Messiah" },
+          hlc: asClock("3000-1-deviceA"),
+          txID: "tx_1",
+          tombstone: false,
+        },
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("stores rows and preserves metadata", async () => {
+    const { adapter, database, engine, cleanup } = createD1SqliteEngine();
+
+    try {
+      const write = await engine.txn([
+        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
+      ]);
+
+      expect(write.writes[0]?.hlc).toBe(asClock("3000-0-deviceA"));
+
+      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+      expect(read.readResults[0]).toEqual({
+        opIndex: 0,
+        kind: "get",
+        row: {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "Dune" },
+          hlc: asClock("3000-0-deviceA"),
+          txID: "tx_1",
+          tombstone: false,
+        },
+      });
+
+      await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
+
+      const raw = await adapter.getRawRow("books", "book-1");
+      expect(raw).toMatchObject({
+        hlc_wall_ms: 3000,
+        hlc_counter: 1,
+        hlc_node_id: "deviceA",
+        tombstone: 1,
+      });
+
+      expect(database.batchSizes).toContain(5);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("applies LWW tie-break with node ID for equal wall/counter", async () => {
+    const { engine, cleanup } = createD1SqliteEngine();
+
+    try {
+      const firstApply = await engine.applyRemote([
+        {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "from A" },
+          hlc: asClock("9000-2-deviceA"),
+          txID: "tx_remote_a",
+          tombstone: false,
+        },
+      ]);
+      expect(firstApply.appliedCount).toBe(1);
+
+      const secondApply = await engine.applyRemote([
+        {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "from Z" },
+          hlc: asClock("9000-2-deviceZ"),
+          txID: "tx_remote_z",
+          tombstone: false,
+        },
+      ]);
+      expect(secondApply.appliedCount).toBe(1);
+
+      const staleApply = await engine.applyRemote([
+        {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "from B" },
+          hlc: asClock("9000-2-deviceB"),
+          txID: "tx_remote_b",
+          tombstone: false,
+        },
+      ]);
+      expect(staleApply.appliedCount).toBe(0);
+
+      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+      expect(read.readResults[0]).toEqual({
+        opIndex: 0,
+        kind: "get",
+        row: {
+          collection: "books",
+          id: "book-1",
+          parentID: null,
+          value: { title: "from Z" },
+          hlc: asClock("9000-2-deviceZ"),
+          txID: "tx_remote_z",
+          tombstone: false,
+        },
+      });
+    } finally {
+      cleanup();
+    }
+  });
+});
