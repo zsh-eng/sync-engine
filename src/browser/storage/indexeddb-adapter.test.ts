@@ -33,6 +33,7 @@ function createIndexedDbEngine() {
 
   const adapter = createIndexedDbRowStoreAdapter<RowValue>({
     dbName,
+    namespace: "books-app",
     indexedDB,
     IDBKeyRange,
   });

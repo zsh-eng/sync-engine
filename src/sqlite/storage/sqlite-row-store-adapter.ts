@@ -7,11 +7,19 @@ import type {
 } from "../../core/storage/types";
 
 const DEFAULT_ROWS_TABLE = "rows";
-const ROW_BIND_PARAMETER_COUNT = 10;
+const ROW_BIND_PARAMETER_COUNT = 11;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 90;
 
 function rowKey(collection: string, id: string): string {
   return `${collection}::${id}`;
+}
+
+function assertNamespace(value: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("Invalid namespace: expected a non-empty string");
+  }
+
+  return value;
 }
 
 function assertSqlIdentifier(value: string): string {
@@ -45,6 +53,7 @@ function toValueJson(value: unknown): string {
 }
 
 export interface SqliteRowRecord {
+  namespace: string;
   collection: string;
   id: string;
   parent_id: string | null;
@@ -71,6 +80,7 @@ export interface SqliteTransactionExecutor {
 
 interface CreateSqliteRowStoreAdapterInput {
   executor: SqliteTransactionExecutor;
+  namespace: string;
   rowsTable?: string;
   maxRowsPerStatement?: number;
 }
@@ -138,6 +148,7 @@ function toEncodedSqliteRow<Value>(row: StoredRow<Value>): EncodedSqliteRow {
 function createRowsSchemaStatements(rowsTable: string): string[] {
   return [
     `CREATE TABLE IF NOT EXISTS ${rowsTable} (
+      namespace TEXT NOT NULL,
       collection TEXT NOT NULL,
       id TEXT NOT NULL,
       parent_id TEXT,
@@ -148,12 +159,12 @@ function createRowsSchemaStatements(rowsTable: string): string[] {
       hlc_node_id TEXT NOT NULL,
       tx_id TEXT NOT NULL,
       tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
-      PRIMARY KEY (collection, id)
+      PRIMARY KEY (namespace, collection, id)
     )`,
-    `CREATE INDEX IF NOT EXISTS ${rowsTable}_collection_idx ON ${rowsTable} (collection)`,
-    `CREATE INDEX IF NOT EXISTS ${rowsTable}_collection_parent_idx ON ${rowsTable} (collection, parent_id)`,
-    `CREATE INDEX IF NOT EXISTS ${rowsTable}_collection_tombstone_idx ON ${rowsTable} (collection, tombstone)`,
-    `CREATE INDEX IF NOT EXISTS ${rowsTable}_hlc_idx ON ${rowsTable} (hlc_wall_ms, hlc_counter, hlc_node_id)`,
+    `CREATE INDEX IF NOT EXISTS ${rowsTable}_namespace_collection_idx ON ${rowsTable} (namespace, collection)`,
+    `CREATE INDEX IF NOT EXISTS ${rowsTable}_namespace_collection_parent_idx ON ${rowsTable} (namespace, collection, parent_id)`,
+    `CREATE INDEX IF NOT EXISTS ${rowsTable}_namespace_collection_tombstone_idx ON ${rowsTable} (namespace, collection, tombstone)`,
+    `CREATE INDEX IF NOT EXISTS ${rowsTable}_namespace_hlc_idx ON ${rowsTable} (namespace, hlc_wall_ms, hlc_counter, hlc_node_id)`,
   ];
 }
 
@@ -163,6 +174,7 @@ export function createSqliteRowStoreSchemaStatements(rowsTable = DEFAULT_ROWS_TA
 
 export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
   private readonly executor: SqliteTransactionExecutor;
+  private readonly namespace: string;
   private readonly rowsTable: string;
   private readonly selectColumns: string;
   private readonly upsertStatementHead: string;
@@ -174,9 +186,11 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
 
   constructor(input: CreateSqliteRowStoreAdapterInput) {
     this.executor = input.executor;
+    this.namespace = assertNamespace(input.namespace);
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? DEFAULT_ROWS_TABLE);
     this.maxRowsPerStatement = this.resolveMaxRowsPerStatement(input.maxRowsPerStatement);
     this.selectColumns = [
+      "namespace",
       "collection",
       "id",
       "parent_id",
@@ -189,6 +203,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
       "tombstone",
     ].join(", ");
     this.upsertStatementHead = `INSERT INTO ${this.rowsTable} (
+      namespace,
       collection,
       id,
       parent_id,
@@ -200,7 +215,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
       tx_id,
       tombstone
     )`;
-    this.upsertStatementTail = `ON CONFLICT(collection, id) DO UPDATE SET
+    this.upsertStatementTail = `ON CONFLICT(namespace, collection, id) DO UPDATE SET
       parent_id = excluded.parent_id,
       value_json = excluded.value_json,
       hlc = excluded.hlc,
@@ -233,24 +248,24 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
         const tx: RowStoreAdapterTransaction<Value> = {
           getAll: async (collection) => {
             const rows = await sql.all<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE collection = ?`,
-              [collection],
+              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE namespace = ? AND collection = ?`,
+              [this.namespace, collection],
             );
             return rows.map((row) => toStoredRow<Value>(row));
           },
 
           get: async (collection, id) => {
             const row = await sql.get<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE collection = ? AND id = ?`,
-              [collection, id],
+              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE namespace = ? AND collection = ? AND id = ?`,
+              [this.namespace, collection, id],
             );
             return row ? toStoredRow<Value>(row) : undefined;
           },
 
           getAllWithParent: async (collection, parentID) => {
             const rows = await sql.all<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE collection = ? AND parent_id = ?`,
-              [collection, parentID],
+              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE namespace = ? AND collection = ? AND parent_id = ?`,
+              [this.namespace, collection, parentID],
             );
             return rows.map((row) => toStoredRow<Value>(row));
           },
@@ -372,6 +387,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
 
     for (const row of rows) {
       params.push(
+        this.namespace,
         row.collection,
         row.id,
         row.parentID,

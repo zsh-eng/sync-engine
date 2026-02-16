@@ -9,6 +9,7 @@ import type {
 } from "../../core/storage/types";
 
 export interface IndexedDbRowRecord<Value = unknown> {
+  namespace: string;
   collection: string;
   id: string;
   parentID: string | null;
@@ -21,7 +22,7 @@ export interface IndexedDbRowRecord<Value = unknown> {
 }
 
 class RowStoreDexieDatabase<Value = unknown> extends Dexie {
-  readonly rows!: Table<IndexedDbRowRecord<Value>, [string, string]>;
+  readonly rows!: Table<IndexedDbRowRecord<Value>, [string, string, string]>;
 
   constructor(
     name: string,
@@ -33,9 +34,17 @@ class RowStoreDexieDatabase<Value = unknown> extends Dexie {
     super(name, options);
 
     this.version(1).stores({
-      rows: "&[collection+id], collection, [collection+parentID], [collection+tombstone], [collection+parentID+tombstone], [hlcWallMs+hlcCounter], [hlcWallMs+hlcCounter+hlcNodeId], [collection+hlcWallMs+hlcCounter+hlcNodeId]",
+      rows: "&[namespace+collection+id], [namespace+collection], [namespace+collection+parentID], [namespace+collection+tombstone], [namespace+collection+parentID+tombstone], [namespace+hlcWallMs+hlcCounter], [namespace+hlcWallMs+hlcCounter+hlcNodeId], [namespace+collection+hlcWallMs+hlcCounter+hlcNodeId]",
     });
   }
+}
+
+function assertNamespace(value: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("Invalid namespace: expected a non-empty string");
+  }
+
+  return value;
 }
 
 function toStoredRow<Value>(row: IndexedDbRowRecord<Value>): StoredRow<Value> {
@@ -54,9 +63,13 @@ function toStoredRow<Value>(row: IndexedDbRowRecord<Value>): StoredRow<Value> {
   };
 }
 
-function toIndexedDbRow<Value>(row: StoredRow<Value>): IndexedDbRowRecord<Value> {
+function toIndexedDbRow<Value>(
+  namespace: string,
+  row: StoredRow<Value>,
+): IndexedDbRowRecord<Value> {
   const parsedClock = parseClock(row.hlc);
   return {
+    namespace,
     collection: row.collection,
     id: row.id,
     parentID: row.parentID,
@@ -71,12 +84,14 @@ function toIndexedDbRow<Value>(row: StoredRow<Value>): IndexedDbRowRecord<Value>
 
 export interface CreateIndexedDbRowStoreAdapterInput {
   dbName: string;
+  namespace: string;
   indexedDB?: IDBFactory;
   IDBKeyRange?: typeof IDBKeyRange;
 }
 
 export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
   private readonly db: RowStoreDexieDatabase<Value>;
+  private readonly namespace: string;
 
   constructor(input: CreateIndexedDbRowStoreAdapterInput) {
     const hasCustomIndexedDb = input.indexedDB !== undefined || input.IDBKeyRange !== undefined;
@@ -87,6 +102,7 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
         }
       : undefined;
 
+    this.namespace = assertNamespace(input.namespace);
     this.db = new RowStoreDexieDatabase<Value>(input.dbName, options);
   }
 
@@ -96,17 +112,20 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
     return this.db.transaction("rw", this.db.rows, async () => {
       return runner({
         getAll: async (collection) => {
-          const rows = await this.db.rows.where("collection").equals(collection).toArray();
+          const rows = await this.db.rows
+            .where("[namespace+collection]")
+            .equals([this.namespace, collection])
+            .toArray();
           return rows.map((row) => toStoredRow(row));
         },
         get: async (collection, id) => {
-          const row = await this.db.rows.get([collection, id]);
+          const row = await this.db.rows.get([this.namespace, collection, id]);
           return row ? toStoredRow(row) : undefined;
         },
         getAllWithParent: async (collection, parentID) => {
           const rows = await this.db.rows
-            .where("[collection+parentID]")
-            .equals([collection, parentID])
+            .where("[namespace+collection+parentID]")
+            .equals([this.namespace, collection, parentID])
             .toArray();
           return rows.map((row) => toStoredRow(row));
         },
@@ -116,13 +135,20 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
           }
 
           // Single round-trip to fetch all existing rows.
-          const keys: [string, string][] = rows.map((r) => [r.collection, r.id]);
+          const keys: [string, string, string][] = rows.map((r) => [
+            this.namespace,
+            r.collection,
+            r.id,
+          ]);
           const existingRecords = await this.db.rows.bulkGet(keys);
           const existingByKey = new Map<string, StoredRow<Value>>();
           for (let i = 0; i < rows.length; i++) {
             const record = existingRecords[i];
             if (record) {
-              existingByKey.set(`${record.collection}::${record.id}`, toStoredRow(record));
+              existingByKey.set(
+                `${record.namespace}::${record.collection}::${record.id}`,
+                toStoredRow(record),
+              );
             }
           }
 
@@ -130,7 +156,7 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
           const outcomes: WriteOutcome[] = [];
 
           for (const row of rows) {
-            const key = `${row.collection}::${row.id}`;
+            const key = `${this.namespace}::${row.collection}::${row.id}`;
             const existing = winners.get(key) ?? existingByKey.get(key);
             const written = !existing || compareClocks(row.hlc, existing.hlc) === 1;
             if (written) {
@@ -147,7 +173,9 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
           }
 
           if (winners.size > 0) {
-            await this.db.rows.bulkPut([...winners.values()].map((r) => toIndexedDbRow(r)));
+            await this.db.rows.bulkPut(
+              [...winners.values()].map((r) => toIndexedDbRow(this.namespace, r)),
+            );
           }
 
           return outcomes;
@@ -157,7 +185,7 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
   }
 
   async getRawRow(collection: string, id: string): Promise<IndexedDbRowRecord<Value> | undefined> {
-    return this.db.rows.get([collection, id]);
+    return this.db.rows.get([this.namespace, collection, id]);
   }
 
   close(): void {

@@ -102,6 +102,7 @@ function createD1SqliteEngine() {
   const database = new FakeD1Database();
   const adapter = createD1SqliteRowStoreAdapter<RowValue>({
     database,
+    namespace: "books-app",
   });
   const engine = createEngine<RowValue>({
     adapter,

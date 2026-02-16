@@ -65,6 +65,7 @@ class BunSqliteTransactionExecutor implements SqliteTransactionExecutor {
 }
 
 export interface CreateBunSqliteRowStoreAdapterInput {
+  namespace: string;
   database?: Database;
   path?: string;
   rowsTable?: string;
@@ -72,18 +73,21 @@ export interface CreateBunSqliteRowStoreAdapterInput {
 
 export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdapter<Value> {
   readonly database: Database;
+  private readonly namespace: string;
   private readonly rowsTable: string;
 
-  constructor(input: CreateBunSqliteRowStoreAdapterInput = {}) {
+  constructor(input: CreateBunSqliteRowStoreAdapterInput) {
     const database = input.database ?? new Database(input.path ?? ":memory:");
     const executor = new BunSqliteTransactionExecutor(database);
 
     super({
       executor,
+      namespace: input.namespace,
       rowsTable: input.rowsTable,
     });
 
     this.database = database;
+    this.namespace = input.namespace;
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? "rows");
   }
 
@@ -91,6 +95,7 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
     const row = this.database
       .query(
         `SELECT
+          namespace,
           collection,
           id,
           parent_id,
@@ -102,9 +107,9 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
           tx_id,
           tombstone
          FROM ${this.rowsTable}
-         WHERE collection = ? AND id = ?`,
+         WHERE namespace = ? AND collection = ? AND id = ?`,
       )
-      .get(collection, id);
+      .get(this.namespace, collection, id);
     return (row ?? undefined) as SqliteRowRecord | undefined;
   }
 
@@ -114,7 +119,7 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
 }
 
 export function createBunSqliteRowStoreAdapter<Value = unknown>(
-  input: CreateBunSqliteRowStoreAdapterInput = {},
+  input: CreateBunSqliteRowStoreAdapterInput,
 ): BunSqliteRowStoreAdapter<Value> {
   return new BunSqliteRowStoreAdapter<Value>(input);
 }

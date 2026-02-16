@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import { createEngine } from "../../core/engine";
 import {
-    createClockService,
-    type ClockStorageAdapter,
-    type HybridLogicalClock,
+  createClockService,
+  type ClockStorageAdapter,
+  type HybridLogicalClock,
 } from "../../core/hlc";
 import { createBunSqliteRowStoreAdapter } from "./bun-sqlite-adapter";
 
@@ -33,7 +33,9 @@ function createBunSqliteEngine() {
     now: () => 3_000,
   });
 
-  const adapter = createBunSqliteRowStoreAdapter<RowValue>();
+  const adapter = createBunSqliteRowStoreAdapter<RowValue>({
+    namespace: "books-app",
+  });
   const engine = createEngine<RowValue>({
     adapter,
     clock,
