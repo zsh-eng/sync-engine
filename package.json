@@ -2,6 +2,13 @@
   "name": "sync-engine",
   "type": "module",
   "module": "index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./core": "./src/core/index.ts",
+    "./browser": "./src/browser/index.ts",
+    "./sqlite": "./src/sqlite/index.ts",
+    "./bun": "./src/bun/index.ts"
+  },
   "scripts": {
     "test": "bun test",
     "format": "oxfmt . --write",
