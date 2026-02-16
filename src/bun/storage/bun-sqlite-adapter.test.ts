@@ -34,6 +34,7 @@ function createBunSqliteEngine() {
   });
 
   const adapter = createBunSqliteRowStoreAdapter<RowValue>({
+    userID: "user-1",
     namespace: "books-app",
   });
   const engine = createEngine<RowValue>({

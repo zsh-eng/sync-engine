@@ -65,6 +65,7 @@ class BunSqliteTransactionExecutor implements SqliteTransactionExecutor {
 }
 
 export interface CreateBunSqliteRowStoreAdapterInput {
+  userID: string;
   namespace: string;
   database?: Database;
   path?: string;
@@ -73,6 +74,7 @@ export interface CreateBunSqliteRowStoreAdapterInput {
 
 export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdapter<Value> {
   readonly database: Database;
+  private readonly userID: string;
   private readonly namespace: string;
   private readonly rowsTable: string;
 
@@ -82,11 +84,13 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
 
     super({
       executor,
+      userID: input.userID,
       namespace: input.namespace,
       rowsTable: input.rowsTable,
     });
 
     this.database = database;
+    this.userID = input.userID;
     this.namespace = input.namespace;
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? "rows");
   }
@@ -95,6 +99,7 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
     const row = this.database
       .query(
         `SELECT
+          user_id,
           namespace,
           collection,
           id,
@@ -107,9 +112,9 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
           tx_id,
           tombstone
          FROM ${this.rowsTable}
-         WHERE namespace = ? AND collection = ? AND id = ?`,
+         WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
       )
-      .get(this.namespace, collection, id);
+      .get(this.userID, this.namespace, collection, id);
     return (row ?? undefined) as SqliteRowRecord | undefined;
   }
 

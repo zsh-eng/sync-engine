@@ -102,6 +102,7 @@ function createD1SqliteEngine() {
   const database = new FakeD1Database();
   const adapter = createD1SqliteRowStoreAdapter<RowValue>({
     database,
+    userID: "user-1",
     namespace: "books-app",
   });
   const engine = createEngine<RowValue>({
@@ -201,7 +202,7 @@ describe("D1SqliteRowStoreAdapter", () => {
         tombstone: 1,
       });
 
-      expect(database.batchSizes).toContain(5);
+      expect(database.batchSizes).toContain(6);
     } finally {
       cleanup();
     }

@@ -98,12 +98,14 @@ class D1SqliteTransactionExecutor implements SqliteTransactionExecutor {
 
 export interface CreateD1SqliteRowStoreAdapterInput {
   database: D1DatabaseLike;
+  userID: string;
   namespace: string;
   rowsTable?: string;
 }
 
 export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdapter<Value> {
   readonly database: D1DatabaseLike;
+  private readonly userID: string;
   private readonly namespace: string;
   private readonly rowsTable: string;
 
@@ -112,11 +114,13 @@ export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdap
 
     super({
       executor,
+      userID: input.userID,
       namespace: input.namespace,
       rowsTable: input.rowsTable,
     });
 
     this.database = input.database;
+    this.userID = input.userID;
     this.namespace = input.namespace;
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? "rows");
   }
@@ -125,6 +129,7 @@ export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdap
     const statement = this.database
       .prepare(
         `SELECT
+          user_id,
           namespace,
           collection,
           id,
@@ -137,9 +142,9 @@ export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdap
           tx_id,
           tombstone
          FROM ${this.rowsTable}
-         WHERE namespace = ? AND collection = ? AND id = ?`,
+         WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
       )
-      .bind(this.namespace, collection, id);
+      .bind(this.userID, this.namespace, collection, id);
     const [result] = await this.database.batch<SqliteRowRecord>([statement]);
     const rows = resultRows(result);
     return rows[0] as SqliteRowRecord | undefined;
