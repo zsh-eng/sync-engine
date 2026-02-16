@@ -1,4 +1,4 @@
-import type { ConnectionManager } from "./connection-manager";
+import type { ConnectionManager } from "../../core/connection/connection-manager";
 
 export interface BrowserBindingsInput {
   manager: ConnectionManager;

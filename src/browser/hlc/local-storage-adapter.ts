@@ -1,5 +1,5 @@
-import { parseClock, type HybridLogicalClock } from "./clock";
-import type { ClockStorageAdapter } from "./service";
+import { parseClock, type HybridLogicalClock } from "../../core/hlc/clock";
+import type { ClockStorageAdapter } from "../../core/hlc/service";
 
 export interface LocalStorageClockAdapterOptions {
   storage?: Storage;

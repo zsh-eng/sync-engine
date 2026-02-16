@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import { createEngine } from "./engine";
 import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "./hlc";
-import { createInMemoryRowStoreAdapter } from "./row-store/in-memory-adapter";
-import type { RowStoreOperation, StoredRow } from "./row-store/types";
+import { createInMemoryRowStoreAdapter } from "./storage/in-memory-adapter";
+import type { RowStoreOperation, StoredRow } from "./storage/types";
 
 interface BookValue {
   title: string;

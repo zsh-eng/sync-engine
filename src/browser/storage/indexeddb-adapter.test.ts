@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { IDBKeyRange, indexedDB } from "fake-indexeddb";
 
-import { createEngine } from "../engine";
-import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "../hlc";
+import { createEngine } from "../../core/engine";
+import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "../../core/hlc";
 import { createIndexedDbRowStoreAdapter } from "./indexeddb-adapter";
 
 interface RowValue {

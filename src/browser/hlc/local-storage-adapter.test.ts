@@ -1,10 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  createClockService,
-  createLocalStorageClockAdapter,
-  type HybridLogicalClock,
-} from "./index";
+import { createClockService, type HybridLogicalClock } from "../../core/hlc";
+import { createLocalStorageClockAdapter } from "./local-storage-adapter";
 
 class MemoryStorage implements Storage {
   #data = new Map<string, string>();

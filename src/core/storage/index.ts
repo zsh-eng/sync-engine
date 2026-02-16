@@ -12,5 +12,3 @@ export type {
 } from "./types";
 
 export { createInMemoryRowStoreAdapter, InMemoryRowStoreAdapter } from "./in-memory-adapter";
-export type { CreateIndexedDbRowStoreAdapterInput, IndexedDbRowRecord } from "./indexeddb-adapter";
-export { createIndexedDbRowStoreAdapter, IndexedDbRowStoreAdapter } from "./indexeddb-adapter";

@@ -14,5 +14,3 @@ export type {
 } from "./service";
 export { createClockService } from "./service";
 
-export type { LocalStorageClockAdapterOptions } from "./local-storage-adapter";
-export { createLocalStorageClockAdapter } from "./local-storage-adapter";

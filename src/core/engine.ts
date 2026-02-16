@@ -9,7 +9,7 @@ import type {
   RowStoreWriteResult,
   StoredRow,
   WriteOutcome,
-} from "./row-store/types";
+} from "./storage/types";
 
 interface CreateEngineInput<Value = unknown> {
   adapter: RowStoreAdapter<Value>;

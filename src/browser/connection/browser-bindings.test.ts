@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { bindBrowserEvents } from "./browser-bindings";
-import { createConnectionManager } from "./connection-manager";
+import { createConnectionManager } from "../../core/connection/connection-manager";
 
 function createMockWindow(opts: { online?: boolean; hidden?: boolean } = {}) {
   const listeners: Record<string, Set<EventListener>> = {};

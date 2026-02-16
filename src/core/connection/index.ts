@@ -16,4 +16,3 @@ export {
   type CreateConnectionManagerInput,
 } from "./connection-manager";
 
-export { bindBrowserEvents, type BrowserBindingsInput } from "./browser-bindings";
