@@ -1,5 +1,5 @@
-import type {HybridLogicalClock} from "./clock";
-import {nextClock, nextClockFromRemote} from "./clock";
+import type { HybridLogicalClock } from "./clock";
+import { nextClock, nextClockFromRemote } from "./clock";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -107,7 +107,10 @@ export function createClockService(input: CreateClockServiceInput): ClockService
       });
     },
 
-    async nextFromRemote(remoteClock: HybridLogicalClock, nowMs?: number): Promise<HybridLogicalClock> {
+    async nextFromRemote(
+      remoteClock: HybridLogicalClock,
+      nowMs?: number,
+    ): Promise<HybridLogicalClock> {
       return enqueue(async () => {
         const last = await load();
         const clock = nextClockFromRemote({

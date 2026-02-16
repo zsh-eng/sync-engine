@@ -1,4 +1,4 @@
-import {describe, expect, test} from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 import {
   compareClocks,
@@ -17,9 +17,9 @@ function asClock(value: string): HybridLogicalClock {
 
 describe("HLC stateless functions", () => {
   test("format/parse roundtrip", () => {
-    const clock = formatClock({wallMs: 100, counter: 2, nodeId: "nodeA"});
+    const clock = formatClock({ wallMs: 100, counter: 2, nodeId: "nodeA" });
     expect(clock).toBe("100-2-nodeA");
-    expect(parseClock(clock)).toEqual({wallMs: 100, counter: 2, nodeId: "nodeA"});
+    expect(parseClock(clock)).toEqual({ wallMs: 100, counter: 2, nodeId: "nodeA" });
   });
 
   test("compareClocks uses wall, then counter, then nodeId", () => {
@@ -34,7 +34,7 @@ describe("HLC stateless functions", () => {
   });
 
   test("nextClock starts from now with counter zero", () => {
-    const clock = nextClock({nodeId: "local", nowMs: 50});
+    const clock = nextClock({ nodeId: "local", nowMs: 50 });
     expect(clock).toBe("50-0-local");
   });
 
@@ -136,7 +136,7 @@ describe("HLC service", () => {
       },
     };
 
-    const service = createClockService({nodeId: "local", storage, now: () => 100});
+    const service = createClockService({ nodeId: "local", storage, now: () => 100 });
 
     expect(await service.peek()).toBeUndefined();
     expect(await service.next()).toBe("100-0-local");
@@ -156,10 +156,10 @@ describe("HLC service", () => {
       },
     };
 
-    const first = createClockService({nodeId: "local", storage, now: () => 100});
+    const first = createClockService({ nodeId: "local", storage, now: () => 100 });
     expect(await first.next()).toBe("100-0-local");
 
-    const second = createClockService({nodeId: "local", storage, now: () => 120});
+    const second = createClockService({ nodeId: "local", storage, now: () => 120 });
     const merged = await second.nextFromRemote(asClock("150-4-remote"));
 
     expect(merged).toBe("150-5-local");
@@ -178,15 +178,10 @@ describe("HLC service", () => {
       },
     };
 
-    const service = createClockService({nodeId: "local", storage, now: () => 300});
+    const service = createClockService({ nodeId: "local", storage, now: () => 300 });
 
     const batch = await service.nextBatch(4);
-    expect(batch).toEqual([
-      "300-0-local",
-      "300-1-local",
-      "300-2-local",
-      "300-3-local",
-    ]);
+    expect(batch).toEqual(["300-0-local", "300-1-local", "300-2-local", "300-3-local"]);
     expect(await service.peek()).toBe("300-3-local");
     expect(stored).toBe("300-3-local");
     expect(writes).toBe(1);
@@ -216,7 +211,7 @@ describe("HLC service", () => {
       },
     };
 
-    const service = createClockService({nodeId: "local", storage, now: () => 200});
+    const service = createClockService({ nodeId: "local", storage, now: () => 200 });
 
     const results = await Promise.all([
       service.next(),

@@ -4,7 +4,7 @@ export type {
   NextClockInput,
   ParsedClock,
 } from "./clock";
-export {compareClocks, formatClock, nextClock, nextClockFromRemote, parseClock} from "./clock";
+export { compareClocks, formatClock, nextClock, nextClockFromRemote, parseClock } from "./clock";
 
 export type {
   ClockService,
@@ -12,4 +12,7 @@ export type {
   CreateClockServiceInput,
   MaybePromise,
 } from "./service";
-export {createClockService} from "./service";
+export { createClockService } from "./service";
+
+export type { LocalStorageClockAdapterOptions } from "./local-storage-adapter";
+export { createLocalStorageClockAdapter } from "./local-storage-adapter";

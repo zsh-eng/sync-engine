@@ -58,7 +58,7 @@ export function parseClock(clock: HybridLogicalClock): ParsedClock {
     throw new Error("Invalid nodeId: cannot be empty");
   }
 
-  return {wallMs, counter, nodeId};
+  return { wallMs, counter, nodeId };
 }
 
 export function compareClocks(a: HybridLogicalClock, b: HybridLogicalClock): -1 | 0 | 1 {
@@ -87,14 +87,14 @@ export function nextClock(input: NextClockInput): HybridLogicalClock {
   const last = input.lastClock ? parseClock(input.lastClock) : undefined;
 
   if (!last) {
-    return formatClock({wallMs: nowMs, counter: 0, nodeId: input.nodeId});
+    return formatClock({ wallMs: nowMs, counter: 0, nodeId: input.nodeId });
   }
 
   if (nowMs > last.wallMs) {
-    return formatClock({wallMs: nowMs, counter: 0, nodeId: input.nodeId});
+    return formatClock({ wallMs: nowMs, counter: 0, nodeId: input.nodeId });
   }
 
-  return formatClock({wallMs: last.wallMs, counter: last.counter + 1, nodeId: input.nodeId});
+  return formatClock({ wallMs: last.wallMs, counter: last.counter + 1, nodeId: input.nodeId });
 }
 
 export function nextClockFromRemote(input: NextClockFromRemoteInput): HybridLogicalClock {

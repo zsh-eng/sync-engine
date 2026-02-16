@@ -95,15 +95,15 @@ flowchart LR
 
 ### 7.2 Module Boundaries
 
-| Module | Responsibility | Inputs | Outputs |
-| --- | --- | --- | --- |
-| ConnectionManager | Connection state machine, retry, pause/resume | transport errors, visibility, connect requests | current connection state |
-| AuthLayer | Token lifecycle and session pinning | token updates, auth errors | validated auth context |
-| TransportAdapter | HTTP/WebSocket abstraction | sync requests | protocol frames/responses |
-| RowSyncEngine | Push/pull rows, merge conflicts, apply tombstones | local ops, remote changes | local row state + cursor token |
-| FileSyncEngine | Upload/download blobs, maintain file manifest (post-v1) | file intents, row references | local file availability |
-| SyncCoordinator | Ordering and orchestration across planes | app events, connection state | bounded work queues and retries |
-| Inspector API | Debugging and observability | local state, queue metadata | tooling endpoints/views |
+| Module            | Responsibility                                          | Inputs                                         | Outputs                         |
+| ----------------- | ------------------------------------------------------- | ---------------------------------------------- | ------------------------------- |
+| ConnectionManager | Connection state machine, retry, pause/resume           | transport errors, visibility, connect requests | current connection state        |
+| AuthLayer         | Token lifecycle and session pinning                     | token updates, auth errors                     | validated auth context          |
+| TransportAdapter  | HTTP/WebSocket abstraction                              | sync requests                                  | protocol frames/responses       |
+| RowSyncEngine     | Push/pull rows, merge conflicts, apply tombstones       | local ops, remote changes                      | local row state + cursor token  |
+| FileSyncEngine    | Upload/download blobs, maintain file manifest (post-v1) | file intents, row references                   | local file availability         |
+| SyncCoordinator   | Ordering and orchestration across planes                | app events, connection state                   | bounded work queues and retries |
+| Inspector API     | Debugging and observability                             | local state, queue metadata                    | tooling endpoints/views         |
 
 ### 7.3 Separation Principle
 
@@ -149,16 +149,16 @@ Canonical row envelope:
 
 Rows are ordered for pull using server-assigned timestamp plus deterministic tie-break:
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| serverTimestampMs | int64 | set by server when a write wins LWW |
-| namespace | string | Partition scope |
-| collection | string | Logical table |
-| id | string | Row id |
-| parentID | string or null | optional parent/entity selector |
-| hlc | string | conflict ordering |
-| deviceID | string | deterministic tie-breaker |
-| txID | string | optional group marker |
+| Field             | Type           | Notes                               |
+| ----------------- | -------------- | ----------------------------------- |
+| serverTimestampMs | int64          | set by server when a write wins LWW |
+| namespace         | string         | Partition scope                     |
+| collection        | string         | Logical table                       |
+| id                | string         | Row id                              |
+| parentID          | string or null | optional parent/entity selector     |
+| hlc               | string         | conflict ordering                   |
+| deviceID          | string         | deterministic tie-breaker           |
+| txID              | string         | optional group marker               |
 
 Stable pull ordering key:
 
@@ -168,15 +168,15 @@ Stable pull ordering key:
 
 File metadata is stored in rows; binary content is stored in blob storage.
 
-| Field | Type | Notes |
-| --- | --- | --- |
-| fileID | string | app-level identifier |
-| blobKey | string | object-store key |
-| hash | string | content hash for verification |
-| sizeBytes | int64 | quota and transfer planning |
-| mimeType | string | hint for consumers |
-| status | enum | pending, uploaded, referenced, deleted |
-| refCount | int | optional GC optimization |
+| Field     | Type   | Notes                                  |
+| --------- | ------ | -------------------------------------- |
+| fileID    | string | app-level identifier                   |
+| blobKey   | string | object-store key                       |
+| hash      | string | content hash for verification          |
+| sizeBytes | int64  | quota and transfer planning            |
+| mimeType  | string | hint for consumers                     |
+| status    | enum   | pending, uploaded, referenced, deleted |
+| refCount  | int    | optional GC optimization               |
 
 ### 8.5 Server Schema Baseline (D1/SQLite)
 
@@ -337,6 +337,7 @@ Decision for v1:
 - Counter width can be implementation-defined (for example 16-bit).
 - On overflow at same wall time, increment logical wall time and reset counter.
 - This keeps HLC monotonic without requiring oversized counters.
+
 ## 11. Deletes And Garbage Collection
 
 ### 11.1 Row Deletes
@@ -414,7 +415,7 @@ const sync = createSyncEngine({
   pullPolicy: {
     enableAcceleratorPulls: true,
   },
-  transport: httpTransport({baseURL}),
+  transport: httpTransport({ baseURL }),
 });
 ```
 
@@ -423,14 +424,14 @@ Hook-first usage:
 ```ts
 const books = useSyncQuery({
   collection: "books",
-  where: {archived: false},
+  where: { archived: false },
 });
 
 const updateBook = useSyncMutation("books.updateByID");
 const removeBook = useSyncMutation("books.removeByID");
 
-await updateBook.mutateAsync({id: "book_1", patch: {title: "Dune Messiah"}});
-await removeBook.mutateAsync({id: "book_1"});
+await updateBook.mutateAsync({ id: "book_1", patch: { title: "Dune Messiah" } });
+await removeBook.mutateAsync({ id: "book_1" });
 ```
 
 ### 14.3 React Integration
@@ -581,41 +582,41 @@ Exit criteria:
 
 ## 21. Risks And Mitigations
 
-| Risk | Impact | Likelihood | Mitigation |
-| --- | --- | --- | --- |
-| Clock skew causes surprising wins/losses | High | Medium | HLC + deterministic tie-break + skew alerts |
-| Tombstone retention too short | High | Medium | watermark-based hard-delete gate + grace period |
-| Cursor rebase too frequent | Medium | Medium | retention tuning + snapshot fallback |
-| Overusing accelerator pulls causes replay overhead | Medium | Medium | keep global loop primary + track replay ratio + throttle accelerator frequency |
-| DX still feels complex | High | Medium | narrow API + starter template + inspector first |
+| Risk                                               | Impact | Likelihood | Mitigation                                                                     |
+| -------------------------------------------------- | ------ | ---------- | ------------------------------------------------------------------------------ |
+| Clock skew causes surprising wins/losses           | High   | Medium     | HLC + deterministic tie-break + skew alerts                                    |
+| Tombstone retention too short                      | High   | Medium     | watermark-based hard-delete gate + grace period                                |
+| Cursor rebase too frequent                         | Medium | Medium     | retention tuning + snapshot fallback                                           |
+| Overusing accelerator pulls causes replay overhead | Medium | Medium     | keep global loop primary + track replay ratio + throttle accelerator frequency |
+| DX still feels complex                             | High   | Medium     | narrow API + starter template + inspector first                                |
 
 ## 22. Open Questions
 
-| ID | Question | Owner | Target Date | Decision Criteria | Status |
-| --- | --- | --- | --- | --- | --- |
-| Q1 | Should CRDT text fields be in v1 or v2? | <tbd> | 2026-02-16 | product need vs complexity budget | Resolved: v2 |
-| Q2 | Should metadata fields be publicly readable by default? | <tbd> | 2026-02-16 | accidental misuse risk vs debugging value | Resolved: internal-by-default |
-| Q3 | Is canonical JSON enough or do we need binary before GA? | <tbd> | 2026-04-01 | payload size and CPU benchmarks | Open |
-| Q4 | Should local SQLite adapter be part of v1 scope? | <tbd> | 2026-03-15 | measured IndexedDB bottlenecks | Open |
-| Q5 | Do we need a first-party `useLiveQuery` in v1? | <tbd> | 2026-02-16 | React Query invalidation ergonomics | Resolved: no |
-| Q6 | Should the cursor token remain opaque forever or expose a typed debug shape? | <tbd> | 2026-03-10 | debugging ergonomics vs API stability | Open |
-| Q7 | Should parent filters be schema-generated or manually declared? | <tbd> | 2026-03-25 | correctness vs developer control | Open |
+| ID  | Question                                                                     | Owner | Target Date | Decision Criteria                         | Status                        |
+| --- | ---------------------------------------------------------------------------- | ----- | ----------- | ----------------------------------------- | ----------------------------- |
+| Q1  | Should CRDT text fields be in v1 or v2?                                      | <tbd> | 2026-02-16  | product need vs complexity budget         | Resolved: v2                  |
+| Q2  | Should metadata fields be publicly readable by default?                      | <tbd> | 2026-02-16  | accidental misuse risk vs debugging value | Resolved: internal-by-default |
+| Q3  | Is canonical JSON enough or do we need binary before GA?                     | <tbd> | 2026-04-01  | payload size and CPU benchmarks           | Open                          |
+| Q4  | Should local SQLite adapter be part of v1 scope?                             | <tbd> | 2026-03-15  | measured IndexedDB bottlenecks            | Open                          |
+| Q5  | Do we need a first-party `useLiveQuery` in v1?                               | <tbd> | 2026-02-16  | React Query invalidation ergonomics       | Resolved: no                  |
+| Q6  | Should the cursor token remain opaque forever or expose a typed debug shape? | <tbd> | 2026-03-10  | debugging ergonomics vs API stability     | Open                          |
+| Q7  | Should parent filters be schema-generated or manually declared?              | <tbd> | 2026-03-25  | correctness vs developer control          | Open                          |
 
 ## 23. Decision Log
 
-| Date | Decision | Rationale | Consequence |
-| --- | --- | --- | --- |
-| 2026-02-15 | Two-plane architecture (rows + files) | Matches data shape and performance needs | Independent evolution of structured and blob sync |
-| 2026-02-15 | Session layer is separate from data layer | Better reuse and testability | Cleaner boundaries and simpler testing |
-| 2026-02-15 | LWW with HLC default | Predictable, low complexity conflict model | Some collaborative text scenarios need future CRDT extension |
-| 2026-02-15 | Tombstone-first deletes | Required for convergence and safe GC | Additional storage and compaction complexity |
-| 2026-02-15 | HTTP correctness path, socket optional | Serverless compatibility | Slightly higher pull latency without push channel |
-| 2026-02-15 | React Query integration first | Fast adoption and familiar tooling | Need invalidation discipline |
-| 2026-02-16 | Row sync prioritized for v1; files deferred | Reduces scope and de-risks initial release | Faster path to stable core protocol |
-| 2026-02-16 | One durable server-issued cursor token with filtered accelerator pulls | Preserves simple durable state while enabling priority sync paths | Replayed rows can increase apply volume |
-| 2026-02-16 | Hook-first strict API boundary | Prevents invalid local writes and repeated optimistic/invalidation boilerplate | Direct local DB querying is intentionally constrained |
-| 2026-02-16 | Inline internal metadata in canonical rows store | Avoids row/meta drift and join-like local reads | Slightly larger row payload in local storage |
-| 2026-02-16 | Cursor ordering uses `(serverTimestampMs, collection, id)` | Deterministic pagination without separate commit sequence | Requires stable index and server-issued cursor tokens |
+| Date       | Decision                                                               | Rationale                                                                      | Consequence                                                  |
+| ---------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| 2026-02-15 | Two-plane architecture (rows + files)                                  | Matches data shape and performance needs                                       | Independent evolution of structured and blob sync            |
+| 2026-02-15 | Session layer is separate from data layer                              | Better reuse and testability                                                   | Cleaner boundaries and simpler testing                       |
+| 2026-02-15 | LWW with HLC default                                                   | Predictable, low complexity conflict model                                     | Some collaborative text scenarios need future CRDT extension |
+| 2026-02-15 | Tombstone-first deletes                                                | Required for convergence and safe GC                                           | Additional storage and compaction complexity                 |
+| 2026-02-15 | HTTP correctness path, socket optional                                 | Serverless compatibility                                                       | Slightly higher pull latency without push channel            |
+| 2026-02-15 | React Query integration first                                          | Fast adoption and familiar tooling                                             | Need invalidation discipline                                 |
+| 2026-02-16 | Row sync prioritized for v1; files deferred                            | Reduces scope and de-risks initial release                                     | Faster path to stable core protocol                          |
+| 2026-02-16 | One durable server-issued cursor token with filtered accelerator pulls | Preserves simple durable state while enabling priority sync paths              | Replayed rows can increase apply volume                      |
+| 2026-02-16 | Hook-first strict API boundary                                         | Prevents invalid local writes and repeated optimistic/invalidation boilerplate | Direct local DB querying is intentionally constrained        |
+| 2026-02-16 | Inline internal metadata in canonical rows store                       | Avoids row/meta drift and join-like local reads                                | Slightly larger row payload in local storage                 |
+| 2026-02-16 | Cursor ordering uses `(serverTimestampMs, collection, id)`             | Deterministic pagination without separate commit sequence                      | Requires stable index and server-issued cursor tokens        |
 
 ## 24. Appendix A: Initial Defaults
 
