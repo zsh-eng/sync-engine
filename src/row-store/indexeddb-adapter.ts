@@ -1,17 +1,16 @@
 import Dexie, { type Table } from "dexie";
 
-import type {
-  RowStoreAdapter,
-  RowStoreAdapterTransaction,
-  StoredRow,
-} from "./types";
+import { formatClock, parseClock } from "../hlc";
+import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow } from "./types";
 
 export interface IndexedDbRowRecord<Value = unknown> {
   collection: string;
   id: string;
   parentID: string | null;
   value: Value | null;
-  hlc: string;
+  hlcWallMs: number;
+  hlcCounter: number;
+  hlcNodeId: string;
   txID: string;
   tombstone: 0 | 1;
 }
@@ -29,7 +28,7 @@ class RowStoreDexieDatabase<Value = unknown> extends Dexie {
     super(name, options);
 
     this.version(1).stores({
-      rows: "&[collection+id], collection, [collection+parentID], [collection+tombstone], [collection+parentID+tombstone]",
+      rows: "&[collection+id], collection, [collection+parentID], [collection+tombstone], [collection+parentID+tombstone], [hlcWallMs+hlcCounter], [hlcWallMs+hlcCounter+hlcNodeId], [collection+hlcWallMs+hlcCounter+hlcNodeId]",
     });
   }
 }
@@ -40,21 +39,26 @@ function toStoredRow<Value>(row: IndexedDbRowRecord<Value>): StoredRow<Value> {
     id: row.id,
     parentID: row.parentID,
     value: row.value,
-    hlc: row.hlc as StoredRow<Value>["hlc"],
+    hlc: formatClock({
+      wallMs: row.hlcWallMs,
+      counter: row.hlcCounter,
+      nodeId: row.hlcNodeId,
+    }) as StoredRow<Value>["hlc"],
     txID: row.txID,
     tombstone: row.tombstone === 1,
   };
 }
 
-function toIndexedDbRow<Value>(
-  row: StoredRow<Value>,
-): IndexedDbRowRecord<Value> {
+function toIndexedDbRow<Value>(row: StoredRow<Value>): IndexedDbRowRecord<Value> {
+  const parsedClock = parseClock(row.hlc);
   return {
     collection: row.collection,
     id: row.id,
     parentID: row.parentID,
     value: row.value,
-    hlc: row.hlc,
+    hlcWallMs: parsedClock.wallMs,
+    hlcCounter: parsedClock.counter,
+    hlcNodeId: parsedClock.nodeId,
     txID: row.txID,
     tombstone: row.tombstone ? 1 : 0,
   };
@@ -66,14 +70,11 @@ export interface CreateIndexedDbRowStoreAdapterInput {
   IDBKeyRange?: typeof IDBKeyRange;
 }
 
-export class IndexedDbRowStoreAdapter<
-  Value = unknown,
-> implements RowStoreAdapter<Value> {
+export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
   private readonly db: RowStoreDexieDatabase<Value>;
 
   constructor(input: CreateIndexedDbRowStoreAdapterInput) {
-    const hasCustomIndexedDb =
-      input.indexedDB !== undefined || input.IDBKeyRange !== undefined;
+    const hasCustomIndexedDb = input.indexedDB !== undefined || input.IDBKeyRange !== undefined;
     const options = hasCustomIndexedDb
       ? {
           indexedDB: input.indexedDB,
@@ -90,10 +91,7 @@ export class IndexedDbRowStoreAdapter<
     return this.db.transaction("rw", this.db.rows, async () => {
       return runner({
         getAll: async (collection) => {
-          const rows = await this.db.rows
-            .where("collection")
-            .equals(collection)
-            .toArray();
+          const rows = await this.db.rows.where("collection").equals(collection).toArray();
           return rows.map((row) => toStoredRow(row));
         },
         get: async (collection, id) => {
@@ -118,10 +116,7 @@ export class IndexedDbRowStoreAdapter<
     });
   }
 
-  async getRawRow(
-    collection: string,
-    id: string,
-  ): Promise<IndexedDbRowRecord<Value> | undefined> {
+  async getRawRow(collection: string, id: string): Promise<IndexedDbRowRecord<Value> | undefined> {
     return this.db.rows.get([collection, id]);
   }
 

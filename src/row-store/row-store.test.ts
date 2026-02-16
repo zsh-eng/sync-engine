@@ -3,13 +3,17 @@ import { describe, expect, test } from "bun:test";
 import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "../hlc";
 import { createInMemoryRowStoreAdapter } from "./in-memory-adapter";
 import { createRowStore } from "./row-store";
-import type { RowStoreOperation } from "./types";
+import type { RowStoreOperation, StoredRow } from "./types";
 
 interface BookValue {
   title: string;
 }
 
-function createTestRowStore() {
+function asClock(value: string): HybridLogicalClock {
+  return value as HybridLogicalClock;
+}
+
+function createTestRowStore(input: { seedRows?: ReadonlyArray<StoredRow<BookValue>> } = {}) {
   let stored: HybridLogicalClock | undefined;
   let txCounter = 0;
 
@@ -26,7 +30,9 @@ function createTestRowStore() {
     now: () => 1_000,
   });
 
-  const adapter = createInMemoryRowStoreAdapter<BookValue>();
+  const adapter = createInMemoryRowStoreAdapter<BookValue>({
+    seedRows: input.seedRows,
+  });
   const rowStore = createRowStore<BookValue>({
     adapter,
     clock,
@@ -274,5 +280,68 @@ describe("RowStore core behavior", () => {
     ]);
 
     expect(notifications).toEqual(["books:book-1:"]);
+  });
+
+  test("skips stale puts when existing row has newer HLC", async () => {
+    const existingRow: StoredRow<BookValue> = {
+      collection: "books",
+      id: "book-1",
+      parentID: null,
+      value: { title: "Remote winner" },
+      hlc: asClock("9000-0-deviceZ"),
+      txID: "tx_remote",
+      tombstone: false,
+    };
+    const { rowStore } = createTestRowStore({
+      seedRows: [existingRow],
+    });
+
+    const writeResult = await rowStore.txn([
+      {
+        kind: "put",
+        collection: "books",
+        id: "book-1",
+        value: { title: "Local stale write" },
+      },
+    ]);
+
+    expect(writeResult.writes).toEqual([]);
+    expect(writeResult.invalidationHints).toEqual([]);
+
+    const readResult = await rowStore.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+    expect(getResultAt(readResult, 0)).toEqual({
+      opIndex: 0,
+      kind: "get",
+      row: existingRow,
+    });
+  });
+
+  test("skips stale deletes when existing row has newer HLC", async () => {
+    const existingRow: StoredRow<BookValue> = {
+      collection: "books",
+      id: "book-1",
+      parentID: null,
+      value: { title: "Remote winner" },
+      hlc: asClock("9000-0-deviceZ"),
+      txID: "tx_remote",
+      tombstone: false,
+    };
+    const { rowStore } = createTestRowStore({
+      seedRows: [existingRow],
+    });
+
+    const deleteResult = await rowStore.txn([
+      { kind: "delete", collection: "books", id: "book-1" },
+    ]);
+
+    expect(deleteResult.writes).toEqual([]);
+    expect(deleteResult.invalidationHints).toEqual([]);
+
+    const readResult = await rowStore.txn([{ kind: "get", collection: "books", id: "book-1" }]);
+    expect(getResultAt(readResult, 0)).toEqual({
+      opIndex: 0,
+      kind: "get",
+      row: existingRow,
+    });
   });
 });

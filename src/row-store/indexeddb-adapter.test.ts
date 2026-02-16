@@ -76,7 +76,12 @@ describe("IndexedDbRowStoreAdapter", () => {
       await rowStore.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
 
       const raw = await adapter.getRawRow("books", "book-1");
-      expect(raw?.tombstone).toBe(1);
+      expect(raw).toMatchObject({
+        hlcWallMs: 2000,
+        hlcCounter: 1,
+        hlcNodeId: "deviceA",
+        tombstone: 1,
+      });
 
       const deleted = await rowStore.txn([{ kind: "get", collection: "books", id: "book-1" }]);
       expect(deleted.readResults[0]).toEqual({
@@ -181,6 +186,12 @@ describe("IndexedDbRowStoreAdapter", () => {
       expect((await adapter.getRawRow("highlights", "h-1"))?.tombstone).toBe(1);
       expect((await adapter.getRawRow("highlights", "h-2"))?.tombstone).toBe(1);
       expect((await adapter.getRawRow("highlights", "h-3"))?.tombstone).toBe(0);
+      expect(await adapter.getRawRow("highlights", "h-3")).toMatchObject({
+        hlcWallMs: 2000,
+        hlcCounter: 2,
+        hlcNodeId: "deviceA",
+        tombstone: 0,
+      });
     } finally {
       await cleanup();
     }

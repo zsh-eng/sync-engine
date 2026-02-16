@@ -1,4 +1,4 @@
-import type { ClockService, HybridLogicalClock } from "../hlc";
+import { compareClocks, type ClockService, type HybridLogicalClock } from "../hlc";
 import type {
   RowStoreAdapter,
   RowStoreInvalidationHint,
@@ -34,9 +34,7 @@ interface DeleteIntent {
 type WriteIntent<Value = unknown> = PutIntent<Value> | DeleteIntent;
 
 export interface RowStore<Value = unknown> {
-  txn(
-    operations: ReadonlyArray<RowStoreOperation<Value>>,
-  ): Promise<RowStoreTxnResult<Value>>;
+  txn(operations: ReadonlyArray<RowStoreOperation<Value>>): Promise<RowStoreTxnResult<Value>>;
   subscribe(listener: RowStoreListener<Value>): () => void;
 }
 
@@ -46,9 +44,7 @@ function defaultTxIDFactory(): string {
   return `${DEFAULT_TX_ID_PREFIX}_${crypto.randomUUID()}`;
 }
 
-function asLiveRow<Value>(
-  row: StoredRow<Value> | undefined,
-): StoredRow<Value> | undefined {
+function asLiveRow<Value>(row: StoredRow<Value> | undefined): StoredRow<Value> | undefined {
   if (!row || row.tombstone) {
     return undefined;
   }
@@ -56,9 +52,7 @@ function asLiveRow<Value>(
   return row;
 }
 
-function asLiveRows<Value>(
-  rows: ReadonlyArray<StoredRow<Value>>,
-): StoredRow<Value>[] {
+function asLiveRows<Value>(rows: ReadonlyArray<StoredRow<Value>>): StoredRow<Value>[] {
   return rows.filter((row) => !row.tombstone);
 }
 
@@ -81,6 +75,10 @@ function uniqueInvalidationHints(
   return unique;
 }
 
+function rowKey(collection: string, id: string): string {
+  return `${collection}::${id}`;
+}
+
 function assertNever(value: never): never {
   throw new Error(`Unsupported operation kind: ${String(value)}`);
 }
@@ -94,9 +92,7 @@ export function createRowStore<Value = unknown>(
   // Serialize transactions to keep operation planning deterministic.
   let queue: Promise<void> = Promise.resolve();
 
-  async function enqueue<Result>(
-    operation: () => Promise<Result>,
-  ): Promise<Result> {
+  async function enqueue<Result>(operation: () => Promise<Result>): Promise<Result> {
     const previous = queue;
     let release: () => void = () => undefined;
     queue = new Promise<void>((resolve) => {
@@ -163,10 +159,7 @@ export function createRowStore<Value = unknown>(
                 break;
               }
               case "get_all_with_parent": {
-                const rows = await tx.getAllWithParent(
-                  operation.collection,
-                  operation.parentID,
-                );
+                const rows = await tx.getAllWithParent(operation.collection, operation.parentID);
                 readResults.push({
                   opIndex,
                   kind: "get_all_with_parent",
@@ -177,10 +170,7 @@ export function createRowStore<Value = unknown>(
               case "put": {
                 let parentID = operation.parentID ?? null;
                 if (operation.parentID === undefined) {
-                  const existing = await tx.get(
-                    operation.collection,
-                    operation.id,
-                  );
+                  const existing = await tx.get(operation.collection, operation.id);
                   parentID = existing?.parentID ?? null;
                 }
 
@@ -194,10 +184,7 @@ export function createRowStore<Value = unknown>(
                 break;
               }
               case "delete": {
-                const existing = await tx.get(
-                  operation.collection,
-                  operation.id,
-                );
+                const existing = await tx.get(operation.collection, operation.id);
                 writeIntents.push({
                   kind: "delete",
                   collection: operation.collection,
@@ -207,10 +194,7 @@ export function createRowStore<Value = unknown>(
                 break;
               }
               case "delete_all_with_parent": {
-                const rows = await tx.getAllWithParent(
-                  operation.collection,
-                  operation.parentID,
-                );
+                const rows = await tx.getAllWithParent(operation.collection, operation.parentID);
                 for (const row of rows) {
                   if (row.tombstone) {
                     continue;
@@ -249,82 +233,112 @@ export function createRowStore<Value = unknown>(
         const clocks: HybridLogicalClock[] = await input.clock.nextBatch(
           planned.writeIntents.length,
         );
-        const rowsToPut: StoredRow<Value>[] = [];
-        const writes: RowStoreWriteResult[] = [];
-        const invalidationHints: RowStoreInvalidationHint[] = [];
 
-        for (let index = 0; index < planned.writeIntents.length; index += 1) {
-          const intent = planned.writeIntents[index]!;
-          const hlc = clocks[index]!;
-          if (!hlc) {
-            throw new Error("Missing HLC for write intent");
+        const applied = await input.adapter.txn(async (tx) => {
+          const stagedRows = new Map<string, StoredRow<Value>>();
+          const writes: RowStoreWriteResult[] = [];
+          const invalidationHints: RowStoreInvalidationHint[] = [];
+
+          for (let index = 0; index < planned.writeIntents.length; index += 1) {
+            const intent = planned.writeIntents[index]!;
+            const hlc = clocks[index]!;
+            if (!hlc) {
+              throw new Error("Missing HLC for write intent");
+            }
+
+            let row: StoredRow<Value>;
+            let write: RowStoreWriteResult;
+            let invalidationHint: RowStoreInvalidationHint;
+
+            switch (intent.kind) {
+              case "put": {
+                row = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  parentID: intent.parentID,
+                  value: intent.value,
+                  hlc,
+                  txID,
+                  tombstone: false,
+                };
+                write = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  parentID: intent.parentID,
+                  hlc,
+                  tombstone: false,
+                };
+                invalidationHint = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  ...(intent.parentID ? { parentID: intent.parentID } : {}),
+                };
+                break;
+              }
+              case "delete": {
+                row = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  parentID: intent.parentID,
+                  value: null,
+                  hlc,
+                  txID,
+                  tombstone: true,
+                };
+                write = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  parentID: intent.parentID,
+                  hlc,
+                  tombstone: true,
+                };
+                invalidationHint = {
+                  collection: intent.collection,
+                  id: intent.id,
+                  ...(intent.parentID ? { parentID: intent.parentID } : {}),
+                };
+                break;
+              }
+              default: {
+                assertNever(intent);
+              }
+            }
+
+            const key = rowKey(row.collection, row.id);
+            const existing = stagedRows.get(key) ?? (await tx.get(row.collection, row.id));
+            if (existing && compareClocks(row.hlc, existing.hlc) !== 1) {
+              continue;
+            }
+
+            stagedRows.set(key, row);
+            writes.push(write);
+            invalidationHints.push(invalidationHint);
           }
 
-          switch (intent.kind) {
-            case "put": {
-              rowsToPut.push({
-                collection: intent.collection,
-                id: intent.id,
-                parentID: intent.parentID,
-                value: intent.value,
-                hlc,
-                txID,
-                tombstone: false,
-              });
-              writes.push({
-                collection: intent.collection,
-                id: intent.id,
-                parentID: intent.parentID,
-                hlc,
-                tombstone: false,
-              });
-              invalidationHints.push({
-                collection: intent.collection,
-                id: intent.id,
-                ...(intent.parentID ? { parentID: intent.parentID } : {}),
-              });
-              break;
-            }
-            case "delete": {
-              rowsToPut.push({
-                collection: intent.collection,
-                id: intent.id,
-                parentID: intent.parentID,
-                value: null,
-                hlc,
-                txID,
-                tombstone: true,
-              });
-              writes.push({
-                collection: intent.collection,
-                id: intent.id,
-                parentID: intent.parentID,
-                hlc,
-                tombstone: true,
-              });
-              invalidationHints.push({
-                collection: intent.collection,
-                id: intent.id,
-                ...(intent.parentID ? { parentID: intent.parentID } : {}),
-              });
-              break;
-            }
-            default: {
-              assertNever(intent);
-            }
+          if (stagedRows.size > 0) {
+            await tx.bulkPut([...stagedRows.values()]);
           }
-        }
 
-        await input.adapter.txn(async (tx) => {
-          await tx.bulkPut(rowsToPut);
-          return undefined;
+          return {
+            writes,
+            invalidationHints,
+          };
         });
+
+        if (applied.writes.length === 0) {
+          return {
+            txID,
+            readResults: planned.readResults,
+            writes: [],
+            invalidationHints: [],
+          };
+        }
 
         const result = {
           txID,
           readResults: planned.readResults,
-          writes,
-          invalidationHints: uniqueInvalidationHints(invalidationHints),
+          writes: applied.writes,
+          invalidationHints: uniqueInvalidationHints(applied.invalidationHints),
         };
 
         notify(result);
