@@ -7,6 +7,10 @@
     "format": "oxfmt . --write",
     "format:check": "oxfmt . --check"
   },
+  "dependencies": {
+    "dexie": "^4.3.0",
+    "fake-indexeddb": "^6.2.5"
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "oxfmt": "^0.32.0"
