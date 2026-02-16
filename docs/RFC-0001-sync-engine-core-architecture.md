@@ -84,8 +84,8 @@ The architecture uses a shared runtime/session layer and namespace-scoped sync e
 ```mermaid
 flowchart LR
   A["App Runtime"] --> B["SyncRuntime (shared)"]
-  B --> C["ConnectionManager + AuthLayer"]
-  B --> D["Transport Adapter"]
+  B --> C["ConnectionManager"]
+  B --> D["Transport Adapter (auth config lives here)"]
   A --> E["NamespaceSyncEngine (books-app)"]
   A --> F["NamespaceSyncEngine (tasks-app)"]
   E --> G["Local Row Store (books-app)"]
@@ -101,18 +101,17 @@ flowchart LR
 
 | Module              | Responsibility                                                                | Inputs                                               | Outputs                                 |
 | ------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------- |
-| SyncRuntime         | Shared connection/auth/transport lifecycle for all active namespaces          | app lifecycle, auth updates, connectivity signals    | runtime connection state + transport IO |
+| SyncRuntime         | Shared connection/transport lifecycle for all active namespaces               | app lifecycle, connectivity signals                  | runtime connection state + transport IO |
 | ConnectionManager   | Connection state machine, retry, pause/resume                                 | transport errors, visibility, connect requests       | current connection state                |
-| AuthLayer           | Token lifecycle and session pinning                                           | token updates, auth errors                           | validated auth context                  |
-| TransportAdapter    | HTTP/WebSocket abstraction                                                    | sync requests                                        | protocol frames/responses               |
-| NamespaceSyncEngine | Push/pull rows for one namespace, own cursor/op-queue, merge conflicts, apply | local ops, runtime state, remote changes             | local row state + namespace cursor      |
-| RowStore            | Local transactional reads/writes, tombstone materialization, changefeed hints | row operations, HLC service                          | query results + invalidation hints      |
+| TransportAdapter    | HTTP/WebSocket abstraction; owns auth credential attachment                   | sync requests, auth config (cookie mode or token callback) | protocol frames/responses + auth error signals |
+| NamespaceSyncEngine | Push/pull rows for one namespace, own cursor/op-queue, HLC stamping, changefeed hints | local ops, runtime state, remote changes, HLC service | local row state + namespace cursor + invalidation hints |
+| RowStoreAdapter     | Local transactional reads/writes with LWW conflict resolution                         | StoredRows (already HLC-stamped)                      | write outcomes (which rows won LWW)                     |
 | FileSyncEngine      | Upload/download blobs, maintain file manifest (post-v1)                       | file intents, row references                         | local file availability                 |
 | Inspector API       | Debugging and observability                                                   | local state, queue metadata, pull/push trace summary | tooling endpoints/views                 |
 
 ### 7.3 Separation Principle
 
-Session and auth code must be reusable regardless of what data plane or namespace is synced. Namespace engines consume runtime state and transport; they do not own auth/session primitives.
+Transport and connection code must be reusable regardless of what data plane or namespace is synced. Auth is configuration on the transport, not a separate layer — cookies work by default (via `credentials: 'include'`), and bearer tokens are opt-in via a token callback passed to the transport factory. Namespace engines consume runtime state and transport; they do not own connection or auth primitives.
 
 ### 7.4 Namespace Topology
 
@@ -380,9 +379,9 @@ Client hard delete is not exposed in v1.
 - Pull emits resulting row changes ordered by `(serverTimestampMs, collection, id)`.
 - Cross-request distributed transactions are out of scope in v1.
 
-### 12.1 Local RowStore Transaction Contract
+### 12.1 Engine Transaction Contract
 
-`RowStore` exposes a single transactional entrypoint:
+The engine exposes two transactional entrypoints: `txn` for local operations and `applyRemote` for server-pulled rows.
 
 ```ts
 type RowStoreOperation =
@@ -392,11 +391,6 @@ type RowStoreOperation =
   | { kind: "put"; collection: string; id: string; value: unknown; parentID?: string | null }
   | { kind: "delete"; collection: string; id: string }
   | { kind: "delete_all_with_parent"; collection: string; parentID: string };
-
-type RowStoreReadResult =
-  | { opIndex: number; kind: "get_all"; rows: StoredRow[] }
-  | { opIndex: number; kind: "get"; row?: StoredRow }
-  | { opIndex: number; kind: "get_all_with_parent"; rows: StoredRow[] };
 
 interface RowStoreTxnResult {
   txID: string;
@@ -412,24 +406,33 @@ interface RowStoreTxnResult {
     id?: string;
     parentID?: string;
   }>;
-  enqueuedMutationIDs: string[];
+}
+
+interface ApplyRemoteResult {
+  appliedCount: number;
+  invalidationHints: Array<{
+    collection: string;
+    id?: string;
+    parentID?: string;
+  }>;
 }
 ```
 
 Execution rules:
 
-- Run all operations in one local DB transaction.
-- Resolve set-based writes (for example `delete_all_with_parent`) to concrete row IDs within the same transaction.
-- Allocate HLC values once per transaction using `nextBatch(writeCount)`, then assign clocks to writes in deterministic operation order.
+- `txn`: dispatch reads and collect write intents in one adapter transaction. Allocate HLCs via `nextBatch(writeCount)` outside the adapter transaction. Apply writes in a second adapter transaction using `applyRows`, which handles LWW conflict resolution.
+- `applyRemote`: rows already carry HLCs from the server. Apply in a single adapter transaction using `applyRows`.
+- Resolve set-based writes (for example `delete_all_with_parent`) to concrete row IDs within the planning transaction.
 - For delete operations, write tombstones rather than hard delete.
+- Storage adapters own LWW conflict resolution: compare incoming HLC against existing row, write only if incoming wins.
 - Storage adapters control physical tombstone encoding (for example `1/0` in Dexie for index-friendly fields).
-- Apply row writes + enqueue op-log entries + publish invalidation hints atomically.
+- Both paths publish invalidation hints to subscribers after successful writes.
 
 ## 13. Local Storage Strategy
 
 ### 13.1 Adapter Interfaces
 
-- `RowStoreAdapter`: transactional operation executor + changefeed/invalidation hints over `(namespace, collection, id)`.
+- `RowStoreAdapter`: transactional reads/writes with LWW conflict resolution via `applyRows`. Returns write outcomes so the engine can derive invalidation hints.
 - `OpLogAdapter`: append/pending mutation tracking.
 - `SyncStateAdapter`: durable replication state (global cursor token, local HLC state, retry/backoff state, ack markers).
 - `FileStoreAdapter`: local blob cache + metadata manifest (post-v1).
@@ -471,16 +474,28 @@ Future:
 ### 14.2 API Surface (Draft)
 
 ```ts
+// Default: cookie-based auth (zero config — browser sends session cookie automatically)
 const sync = createSyncEngine({
   schema,
   namespace: appName,
-  auth: () => token,
   rowStore: indexedDBAdapter(),
   mode: "strict",
   pullPolicy: {
     enableAcceleratorPulls: true,
   },
   transport: httpTransport({ baseURL }),
+});
+
+// Bearer token auth (opt-in for environments where cookies don't work)
+const sync = createSyncEngine({
+  schema,
+  namespace: appName,
+  rowStore: indexedDBAdapter(),
+  mode: "strict",
+  transport: httpTransport({
+    baseURL,
+    auth: { type: "bearer", token: () => getAccessToken() },
+  }),
 });
 ```
 
@@ -549,7 +564,9 @@ Future option:
 
 ## 15. Security And Privacy
 
-- Token never persisted in plaintext beyond session policy.
+- Default cookie-based auth relies on `httpOnly` + `secure` session cookies managed by the auth provider (e.g. Better Auth). The sync engine never sees or stores the token.
+- Bearer token mode: the app-provided `token` callback is invoked per-request by the transport. The sync engine does not persist tokens; token lifecycle is the app's responsibility.
+- Transport surfaces auth errors (e.g. 401) as typed events; the runtime's connection state machine decides whether to pause sync and notify the app.
 - File uploads use scoped URLs/tokens with TTL.
 - Per-namespace auth boundary enforced server-side.
 - Redact sensitive payloads from logs by default.
@@ -562,7 +579,7 @@ Future option:
 - mutation retry count
 - pull latency
 - time-to-converge
-- auth failure rate
+- transport auth error rate (401/403 responses)
 - cursor rebase rate
 - accelerator replay ratio
 
@@ -661,7 +678,7 @@ Exit criteria:
   - HLC ordering and tie-break
   - idempotent mutation replay
 - Integration:
-  - auth invalidation -> needs-auth -> reconnect
+  - transport auth error (401) -> connection pause -> app re-auth -> reconnect
   - duplicate/out-of-order push requests
   - pull pagination and cursor handoff
 - Resilience:
@@ -711,14 +728,18 @@ Exit criteria:
 | 2026-02-16 | Cursor ordering uses `(serverTimestampMs, collection, id)`              | Deterministic pagination without separate commit sequence                       | Requires stable index and server-issued cursor tokens        |
 | 2026-02-16 | Shared `SyncRuntime` + per-namespace `NamespaceSyncEngine`              | Keeps app APIs namespace-light while preserving isolation of durable sync state | Multi-namespace apps compose engines explicitly              |
 | 2026-02-16 | `op_log` remains authoritative; `dirty` is optional derived hint        | Guarantees ordering/retry/idempotency and crash-safe replay semantics           | Slightly more local metadata than a `dirty`-only approach    |
-| 2026-02-16 | RowStore owns invalidation via changefeed hints                         | Unifies local writes and remote apply invalidation semantics                    | Hooks depend on RowStore event contract                      |
-| 2026-02-16 | RowStore `txn` accepts discriminated union ops and returns typed result | Single write path with deterministic HLC assignment and clear invalidation map  | Adapter implementations must support set-op expansion        |
+| 2026-02-16 | Engine owns invalidation via changefeed hints                           | Unifies local writes and remote apply invalidation semantics                    | Hooks depend on engine event contract                        |
+| 2026-02-16 | Engine `txn` accepts discriminated union ops and returns typed result   | Single write path with deterministic HLC assignment and clear invalidation map  | Adapter implementations must support set-op expansion        |
+| 2026-02-16 | LWW conflict resolution pushed into adapters                            | Adapters can use native conflict handling (SQLite ON CONFLICT, IndexedDB bulkGet) | Engine apply phase is a single `applyRows` call; adapters own conflict semantics |
+| 2026-02-16 | Engine exposes `applyRemote` for server-pulled rows                     | Clean separation of local writes (need HLC allocation) from remote applies (HLCs already present) | Two distinct write paths through same adapter `applyRows` contract |
+| 2026-02-16 | `AuthLayer` removed; auth is transport configuration                    | Auth is mechanically tied to transport (cookies via fetch options, bearer via headers, WS via query params). Separate layer creates a seam that doesn't earn its keep. Follows Better Auth's model: cookies are default, bearer is opt-in. | Transport owns credential attachment + auth error signaling; runtime owns policy (pause/resume on auth failure) |
 
 ## 24. Appendix A: Initial Defaults
 
 - Scope: row sync first in v1, file sync deferred.
 - Conflict resolution: LWW with HLC + device tie-break.
-- Transport: HTTP push/pull required, socket notifications optional.
+- Auth: cookie-based by default (zero config); bearer token opt-in via transport config.
+- Transport: HTTP push/pull required, socket notifications optional. Auth credential attachment is transport-owned.
 - Deletes: soft-delete tombstones, hard-delete after watermark gate.
 - Text fields: LWW in v1.
 - Metadata fields: internal by default, debug/advanced opt-in.
