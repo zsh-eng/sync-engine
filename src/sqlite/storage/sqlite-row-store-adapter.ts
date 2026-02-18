@@ -9,14 +9,17 @@ import type {
   RowStorageAdapter,
   StoredRow,
 } from "../../core/types";
+import { createSerialQueue } from "../../core/internal/serial-queue";
+import {
+  appendPendingOperations,
+  getPendingOperations,
+  removePendingOperationsThrough,
+  rowKey,
+} from "../../core/storage/shared";
 
 const DEFAULT_ROWS_TABLE = "rows";
 const ROW_BIND_PARAMETER_COUNT = 12;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 90;
-
-function rowKey(collectionId: string, id: string): string {
-  return `${collectionId}::${id}`;
-}
 
 function assertNamespace(value: string): string {
   if (typeof value !== "string" || value.length === 0) {
@@ -62,19 +65,6 @@ function toValueJson(value: unknown): string {
     throw new Error("Row value must be JSON-serializable");
   }
   return encoded;
-}
-
-function clonePendingOperation<S extends CollectionValueMap>(
-  operation: PendingOperation<S>,
-): PendingOperation<S> {
-  if (operation.type === "put") {
-    return {
-      ...operation,
-      data: structuredClone(operation.data),
-    };
-  }
-
-  return { ...operation };
 }
 
 export interface SqliteRowRecord {
@@ -217,9 +207,9 @@ export class SqliteRowStoreAdapter<
   private readonly upsertStatementTail: string;
   private readonly maxRowsPerStatement: number;
   private readonly pendingOperations: PendingOperation<S>[] = [];
+  private readonly queue = createSerialQueue();
 
   private schemaReady: Promise<void> | undefined;
-  private queue: Promise<void> = Promise.resolve();
 
   constructor(input: CreateSqliteRowStoreAdapterInput) {
     this.executor = input.executor;
@@ -282,7 +272,7 @@ export class SqliteRowStoreAdapter<
     collectionId: C,
     id: RowId,
   ): Promise<StoredRow<S, C> | undefined> {
-    return this.enqueue(async () => {
+    return this.queue.run(async () => {
       await this.ensureSchema();
       return this.executor.transaction(async (sql) => {
         const row = await sql.get<SqliteRowRecord>(
@@ -295,7 +285,7 @@ export class SqliteRowStoreAdapter<
   }
 
   async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
-    return this.enqueue(async () => {
+    return this.queue.run(async () => {
       await this.ensureSchema();
       return this.executor.transaction(async (sql) => {
         const rows = await sql.all<SqliteRowRecord>(
@@ -311,7 +301,7 @@ export class SqliteRowStoreAdapter<
     collectionId: C,
     parentId: RowId,
   ): Promise<Array<StoredRow<S, C>>> {
-    return this.enqueue(async () => {
+    return this.queue.run(async () => {
       await this.ensureSchema();
       return this.executor.transaction(async (sql) => {
         const rows = await sql.all<SqliteRowRecord>(
@@ -328,7 +318,7 @@ export class SqliteRowStoreAdapter<
       return [];
     }
 
-    return this.enqueue(async () => {
+    return this.queue.run(async () => {
       await this.ensureSchema();
 
       return this.executor.transaction(async (sql) => {
@@ -346,34 +336,29 @@ export class SqliteRowStoreAdapter<
   }
 
   async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
-    await this.enqueue(async () => {
-      for (const operation of operations) {
-        this.pendingOperations.push(clonePendingOperation(operation));
-      }
-      this.pendingOperations.sort((a, b) => a.sequence - b.sequence);
+    await this.queue.run(async () => {
+      appendPendingOperations(this.pendingOperations, operations);
     });
   }
 
   async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
-    return this.enqueue(async () => {
-      return this.pendingOperations
-        .slice(0, Math.max(0, limit))
-        .map((operation) => clonePendingOperation(operation));
+    return this.queue.run(async () => {
+      return getPendingOperations(this.pendingOperations, limit);
     });
   }
 
   async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
-    await this.enqueue(async () => {
-      for (let index = this.pendingOperations.length - 1; index >= 0; index -= 1) {
-        if (this.pendingOperations[index]!.sequence <= sequenceInclusive) {
-          this.pendingOperations.splice(index, 1);
-        }
-      }
+    await this.queue.run(async () => {
+      this.pendingOperations.splice(
+        0,
+        this.pendingOperations.length,
+        ...removePendingOperationsThrough(this.pendingOperations, sequenceInclusive),
+      );
     });
   }
 
   async getRawRow(collectionId: string, id: string): Promise<SqliteRowRecord | undefined> {
-    return this.enqueue(async () => {
+    return this.queue.run(async () => {
       await this.ensureSchema();
       return this.executor.transaction(async (sql) => {
         return sql.get<SqliteRowRecord>(
@@ -400,22 +385,6 @@ export class SqliteRowStoreAdapter<
     }
 
     await this.schemaReady;
-  }
-
-  private async enqueue<Result>(operation: () => Promise<Result>): Promise<Result> {
-    const previous = this.queue;
-    let release: () => void = () => undefined;
-
-    this.queue = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
   }
 
   private async applyRowsInternal(

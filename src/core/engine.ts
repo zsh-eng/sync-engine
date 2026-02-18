@@ -1,5 +1,6 @@
 import type { ClockService } from "./hlc";
 import { parseClock } from "./hlc";
+import { createSerialQueue } from "./internal/serial-queue";
 import type {
   AnyStoredRow,
   CollectionId,
@@ -8,6 +9,9 @@ import type {
   RowId,
   RowStorageAdapter,
   Storage,
+  StorageChangeEvent,
+  StorageInvalidationHint,
+  StorageListener,
   StorageOp,
   StorageResult,
   StorageResults,
@@ -30,18 +34,9 @@ interface WriteIntent<S extends CollectionValueMap> {
   data: unknown | null;
 }
 
-export interface EngineInvalidationHint<S extends CollectionValueMap> {
-  collectionId: CollectionId<S>;
-  id?: RowId;
-  parentId?: RowId;
-}
-
-export interface EngineEvent<S extends CollectionValueMap> {
-  source: "local" | "remote";
-  invalidationHints: Array<EngineInvalidationHint<S>>;
-}
-
-export type EngineListener<S extends CollectionValueMap> = (event: EngineEvent<S>) => void;
+export type EngineInvalidationHint<S extends CollectionValueMap> = StorageInvalidationHint<S>;
+export type EngineEvent<S extends CollectionValueMap> = StorageChangeEvent<S>;
+export type EngineListener<S extends CollectionValueMap> = StorageListener<S>;
 
 export interface ApplyRemoteResult<S extends CollectionValueMap> {
   appliedCount: number;
@@ -53,7 +48,6 @@ export interface Engine<
   KV extends Record<string, unknown> = Record<string, unknown>,
 > extends Storage<S, KV> {
   applyRemote(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<ApplyRemoteResult<S>>;
-  subscribe(listener: EngineListener<S>): () => void;
 }
 
 const DEFAULT_TX_ID_PREFIX = "tx";
@@ -133,24 +127,7 @@ export function createEngine<
   const txIDFactory = input.txIDFactory ?? defaultTxIDFactory;
   const kvStore = new Map<string, unknown>();
   let nextPendingSequence = 1;
-
-  // Serialize engine operations to keep planning deterministic.
-  let queue: Promise<void> = Promise.resolve();
-
-  async function enqueue<Result>(operation: () => Promise<Result>): Promise<Result> {
-    const previous = queue;
-    let release: () => void = () => undefined;
-    queue = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
+  const queue = createSerialQueue();
 
   function notify(source: "local" | "remote", hints: Array<EngineInvalidationHint<S>>): void {
     if (hints.length === 0) {
@@ -175,7 +152,7 @@ export function createEngine<
         return [] as StorageResults<S, Ops>;
       }
 
-      return enqueue(async () => {
+      return queue.run(async () => {
         const txID = txIDFactory();
         const results: unknown[] = Array.from({ length: operations.length });
         const writeIntents: Array<WriteIntent<S>> = [];
@@ -409,7 +386,7 @@ export function createEngine<
         return { appliedCount: 0, invalidationHints: [] };
       }
 
-      return enqueue(async () => {
+      return queue.run(async () => {
         const outcomes = await input.adapter.applyRows([...rows]);
         const invalidationHints: Array<EngineInvalidationHint<S>> = [];
         let appliedCount = 0;

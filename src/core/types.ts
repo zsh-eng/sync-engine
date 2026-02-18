@@ -113,6 +113,21 @@ export interface StorageWriteResult<
   applied: boolean;
 }
 
+export interface StorageInvalidationHint<S extends CollectionValueMap> {
+  collectionId: CollectionId<S>;
+  id?: RowId;
+  parentId?: RowId;
+}
+
+export interface StorageChangeEvent<S extends CollectionValueMap> {
+  source: "local" | "remote";
+  invalidationHints: Array<StorageInvalidationHint<S>>;
+}
+
+export type StorageListener<S extends CollectionValueMap> = (
+  event: StorageChangeEvent<S>,
+) => void;
+
 export type StorageResult<S extends CollectionValueMap, Op extends StorageOp<S>> =
   Op extends StorageOpGet<S, infer C extends CollectionId<S>>
     ? StoredRow<S, C> | undefined
@@ -200,6 +215,7 @@ export interface Storage<
   putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void>;
   getKV<Key extends keyof KV & string>(key: Key): Promise<KV[Key] | undefined>;
   deleteKV<Key extends keyof KV & string>(key: Key): Promise<void>;
+  subscribe(listener: StorageListener<S>): () => void;
 }
 
 export type StorageFactory<

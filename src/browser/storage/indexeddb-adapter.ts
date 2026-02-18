@@ -11,38 +11,12 @@ import type {
   RowStorageAdapter,
   StoredRow,
 } from "../../core/types";
-
-function compareHlc(
-  a: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
-  b: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
-): -1 | 0 | 1 {
-  if (a.hlcTimestampMs !== b.hlcTimestampMs) {
-    return a.hlcTimestampMs < b.hlcTimestampMs ? -1 : 1;
-  }
-
-  if (a.hlcCounter !== b.hlcCounter) {
-    return a.hlcCounter < b.hlcCounter ? -1 : 1;
-  }
-
-  if (a.hlcDeviceId === b.hlcDeviceId) {
-    return 0;
-  }
-
-  return a.hlcDeviceId < b.hlcDeviceId ? -1 : 1;
-}
-
-function clonePendingOperation<S extends CollectionValueMap>(
-  operation: PendingOperation<S>,
-): PendingOperation<S> {
-  if (operation.type === "put") {
-    return {
-      ...operation,
-      data: structuredClone(operation.data),
-    };
-  }
-
-  return { ...operation };
-}
+import {
+  appendPendingOperations,
+  compareHlc,
+  getPendingOperations,
+  removePendingOperationsThrough,
+} from "../../core/storage/shared";
 
 export interface IndexedDbRowRecord<S extends CollectionValueMap = Record<string, unknown>> {
   namespace: string;
@@ -241,26 +215,17 @@ export class IndexedDbRowStoreAdapter<
   }
 
   async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
-    if (operations.length === 0) {
-      return;
-    }
-
-    for (const operation of operations) {
-      this.pendingOperations.push(clonePendingOperation(operation));
-    }
-
-    this.pendingOperations.sort((a, b) => a.sequence - b.sequence);
+    appendPendingOperations(this.pendingOperations, operations);
   }
 
   async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
-    return this.pendingOperations
-      .slice(0, Math.max(0, limit))
-      .map((operation) => clonePendingOperation(operation));
+    return getPendingOperations(this.pendingOperations, limit);
   }
 
   async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
-    this.pendingOperations = this.pendingOperations.filter(
-      (operation) => operation.sequence > sequenceInclusive,
+    this.pendingOperations = removePendingOperationsThrough(
+      this.pendingOperations,
+      sequenceInclusive,
     );
   }
 

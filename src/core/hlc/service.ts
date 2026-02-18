@@ -1,5 +1,6 @@
 import type { HybridLogicalClock } from "./clock";
 import { nextClock, nextClockFromRemote } from "./clock";
+import { createSerialQueue } from "../internal/serial-queue";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -25,9 +26,7 @@ export function createClockService(input: CreateClockServiceInput): ClockService
   const now = input.now ?? Date.now;
   let current: HybridLogicalClock | undefined;
   let hasLoaded = false;
-
-  // Serialize operations to prevent clock regressions from concurrent callers.
-  let queue: Promise<void> = Promise.resolve();
+  const queue = createSerialQueue();
 
   async function load(): Promise<HybridLogicalClock | undefined> {
     if (!hasLoaded) {
@@ -43,28 +42,13 @@ export function createClockService(input: CreateClockServiceInput): ClockService
     await input.storage.write(clock);
   }
 
-  async function enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = queue;
-    let release: () => void = () => undefined;
-    queue = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
   return {
     async peek(): Promise<HybridLogicalClock | undefined> {
       return load();
     },
 
     async next(nowMs?: number): Promise<HybridLogicalClock> {
-      return enqueue(async () => {
+      return queue.run(async () => {
         const last = await load();
         const clock = nextClock({
           lastClock: last,
@@ -81,7 +65,7 @@ export function createClockService(input: CreateClockServiceInput): ClockService
         throw new Error(`Invalid count: expected a positive integer, received ${count}`);
       }
 
-      return enqueue(async () => {
+      return queue.run(async () => {
         const baseNowMs = nowMs ?? now();
         const clocks: HybridLogicalClock[] = [];
         let last = await load();
@@ -111,7 +95,7 @@ export function createClockService(input: CreateClockServiceInput): ClockService
       remoteClock: HybridLogicalClock,
       nowMs?: number,
     ): Promise<HybridLogicalClock> {
-      return enqueue(async () => {
+      return queue.run(async () => {
         const last = await load();
         const clock = nextClockFromRemote({
           lastLocalClock: last,
