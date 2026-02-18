@@ -1,98 +1,274 @@
-type RowOperation = null;
-type RowOperationResult = null;
-type RowId = null;
+export type CollectionValueMap = Record<string, unknown>;
 
-// Executes against specific rows
-type RowStorageAdapter = {
-  // Apply just applies the storage operations with conflict resolution behaviour
-  execute: (operations: Array<RowOperation>) => Promise<Array<RowOperationResult>>;
-  // applyPending applies + appends to the pending operations (for syncing purposes)
-  executeLocal: (operations: Array<RowOperation>) => Promise<Array<RowOperationResult>>;
-  removePending: (rowIds: Array<RowId>) => Promise<void>;
-}
+export type CollectionId<S extends CollectionValueMap> = Extract<keyof S, string>;
+export type Namespace = string;
+export type RowId = string;
+export type PendingSequence = number;
 
-type StorageOpGet = {
-  type: 'get';
-  collectionId: string;
-  id: string;
-}
+// Zod compatibility without taking a runtime dependency on zod.
+// Works with zod schemas because zod types carry an `_output` type member.
+export type SchemaLike<TOutput> = { _output: TOutput };
 
-type StorageOpGetAll = {
-  type: 'getAll';
-  collectionId: string;
-}
-
-type StorageOpGetAllWithParent = {
-  type: 'getAllWithParent';
-  collectionId: string;
-  parentId: string;
-}
-
-type StorageOpPut = {
-  type: 'put';
-  collectionId: string;
-  id: string;
-  data: any;
-}
-
-type StorageOpDelete = {
-  type: 'delete';
-  collectionId: string;
-  id: string;
-}
-
-type StorageOpDeleteAllWithParent = {
-  type: 'deleteAllWithParent';
-  collectionId: string;
-  parentId: string;
-}
-
-type StorageOp = StorageOpGet | StorageOpGetAll | StorageOpGetAllWithParent | StorageOpPut | StorageOpDelete | StorageOpDeleteAllWithParent;
-
-type StorageFactory = (namespace: string, adapter: RowStorageAdapter, options?: any) => Storage;
-
-// Storage should be some kind of generic type that would give us the right value based on the the operation
-// which will also be generic
-// The sync engine sends the specified operations to the storage layer
-// The storage layer will transform the storage operations into row operations that the adapter can execute
-// Why do we need to do this? Because the storage layer need to enrich the operations with HLC etc.
-// Storage also maintains a basic key value store that can be used
-// For instance, the sync engine uses it to maintain the sync cursors
-type Storage = {
-  execute: (operations: Array<StorageOp>) => Promise<Array<any>>;
-
-  write: (key: string, value: any) => Promise<void>;
-  read: (key: string) => Promise<any>;
-}
-
-
-// We create the connection manager with a specific driver (e.g. browser, or react-native
-// that has the bindings to drive the connection manager's FSM)
-// The SyncEngine can subscribe to changes in the connection manager to drive its own
-// internal sync loop
-type ConnectionManager = null;
-type ConnectionDriver = null;
-
-type TransportPushRequest = null;
-type TransportPushResponse = null;
-type TransportPullCursor = null;
-// The transport pull responses will most likely be StorageOps that we can execute? Or maybe even row ops for simplicity
-type TransportPullResponse = {
-  ops: Array<StorageOp>;
-  nextCursor: TransportPullCursor;
-  hasMore: boolean;
+export type InferCollectionsFromSchemas<Schemas extends Record<string, SchemaLike<unknown>>> = {
+  [Key in keyof Schemas]: Schemas[Key]["_output"];
 };
 
-type TransportAdapter = {
-  pull: (request: TransportPullCursor) => Promise<Array<TransportPullResponse>>;
-  push: (requests: Array<TransportPushRequest>) => Promise<Array<TransportPushResponse>>;
-  on: (events: Array<TransportPushResponse>) => void;
+export interface HlcFields {
+  hlcTimestampMs: number;
+  hlcCounter: number;
+  hlcDeviceId: string;
 }
 
-type SyncEngineFactory = (storage: Storage, connectionManager: ConnectionManager, transportAdapter: TransportAdapter) => Promise<SyncEngine>;
-// Sync engine will subscribe to connection manager, to manage its periodic polling
-// It will also maintain the sync cursors to know what to pull next
-type SyncEngine = {
-  start: () => Promise<void>;
-  stop: () => Promise<void>;
+export interface StoredRow<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> extends HlcFields {
+  namespace: Namespace;
+  collectionId: C;
+  id: RowId;
+  parentId: RowId | null;
+  data: S[C] | null;
+  tombstone: boolean;
+  txId?: string;
+  schemaVersion?: number;
+  committedTimestampMs: number;
 }
+
+export type AnyStoredRow<S extends CollectionValueMap> = StoredRow<S, CollectionId<S>>;
+
+export interface StorageOpGet<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "get";
+  collectionId: C;
+  id: RowId;
+}
+
+export interface StorageOpGetAll<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "getAll";
+  collectionId: C;
+}
+
+export interface StorageOpGetAllWithParent<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "getAllWithParent";
+  collectionId: C;
+  parentId: RowId;
+}
+
+export interface StorageOpPut<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "put";
+  collectionId: C;
+  id: RowId;
+  data: S[C];
+  parentId?: RowId | null;
+  txId?: string;
+  schemaVersion?: number;
+}
+
+export interface StorageOpDelete<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "delete";
+  collectionId: C;
+  id: RowId;
+}
+
+export interface StorageOpDeleteAllWithParent<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> {
+  type: "deleteAllWithParent";
+  collectionId: C;
+  parentId: RowId;
+}
+
+export type StorageOp<S extends CollectionValueMap> =
+  | StorageOpGet<S>
+  | StorageOpGetAll<S>
+  | StorageOpGetAllWithParent<S>
+  | StorageOpPut<S>
+  | StorageOpDelete<S>
+  | StorageOpDeleteAllWithParent<S>;
+
+export interface StorageWriteResult<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> extends HlcFields {
+  collectionId: C;
+  id: RowId;
+  parentId: RowId | null;
+  tombstone: boolean;
+  committedTimestampMs: number;
+  applied: boolean;
+}
+
+export type StorageResult<S extends CollectionValueMap, Op extends StorageOp<S>> =
+  Op extends StorageOpGet<S, infer C extends CollectionId<S>>
+    ? StoredRow<S, C> | undefined
+    : Op extends StorageOpGetAll<S, infer C extends CollectionId<S>>
+      ? Array<StoredRow<S, C>>
+      : Op extends StorageOpGetAllWithParent<S, infer C extends CollectionId<S>>
+        ? Array<StoredRow<S, C>>
+        : Op extends StorageOpPut<S, infer C extends CollectionId<S>>
+          ? StorageWriteResult<S, C>
+          : Op extends StorageOpDelete<S, infer C extends CollectionId<S>>
+            ? StorageWriteResult<S, C>
+            : Op extends StorageOpDeleteAllWithParent<S, infer C extends CollectionId<S>>
+              ? Array<StorageWriteResult<S, C>>
+              : never;
+
+export type StorageResults<S extends CollectionValueMap, Ops extends readonly StorageOp<S>[]> = {
+  [Index in keyof Ops]: Ops[Index] extends StorageOp<S> ? StorageResult<S, Ops[Index]> : never;
+};
+
+export interface PendingPutOperation<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> extends HlcFields {
+  sequence: PendingSequence;
+  type: "put";
+  collectionId: C;
+  id: RowId;
+  parentId: RowId | null;
+  data: S[C];
+  txId?: string;
+  schemaVersion?: number;
+}
+
+export interface PendingDeleteOperation<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> extends HlcFields {
+  sequence: PendingSequence;
+  type: "delete";
+  collectionId: C;
+  id: RowId;
+  parentId: RowId | null;
+  txId?: string;
+  schemaVersion?: number;
+}
+
+export type PendingOperation<S extends CollectionValueMap> =
+  | PendingPutOperation<S>
+  | PendingDeleteOperation<S>;
+
+export interface RowApplyOutcome<
+  S extends CollectionValueMap,
+  C extends CollectionId<S> = CollectionId<S>,
+> extends HlcFields {
+  written: boolean;
+  collectionId: C;
+  id: RowId;
+  parentId: RowId | null;
+  tombstone: boolean;
+  committedTimestampMs: number;
+}
+
+export interface RowStorageAdapter<S extends CollectionValueMap> {
+  get<C extends CollectionId<S>>(collectionId: C, id: RowId): Promise<StoredRow<S, C> | undefined>;
+  getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>>;
+  getAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StoredRow<S, C>>>;
+  applyRows(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<Array<RowApplyOutcome<S>>>;
+  appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void>;
+  getPending(limit: number): Promise<Array<PendingOperation<S>>>;
+  removePendingThrough(sequenceInclusive: PendingSequence): Promise<void>;
+}
+
+export interface Storage<
+  S extends CollectionValueMap,
+  KV extends Record<string, unknown> = Record<string, unknown>,
+> {
+  execute<const Ops extends readonly StorageOp<S>[]>(operations: Ops): Promise<StorageResults<S, Ops>>;
+  getPending(limit: number): Promise<Array<PendingOperation<S>>>;
+  removePendingThrough(sequenceInclusive: PendingSequence): Promise<void>;
+  putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void>;
+  getKV<Key extends keyof KV & string>(key: Key): Promise<KV[Key] | undefined>;
+  deleteKV<Key extends keyof KV & string>(key: Key): Promise<void>;
+}
+
+export type StorageFactory<
+  S extends CollectionValueMap,
+  KV extends Record<string, unknown> = Record<string, unknown>,
+  Options = unknown,
+> = (namespace: Namespace, adapter: RowStorageAdapter<S>, options?: Options) => Storage<S, KV>;
+
+export type ConnectionState = "offline" | "connected" | "needsAuth" | "paused";
+
+export interface ConnectionDriver {
+  subscribe(listener: (state: ConnectionState) => void): () => void;
+}
+
+export interface ConnectionManager {
+  getState(): ConnectionState;
+  subscribe(listener: (state: ConnectionState) => void): () => void;
+}
+
+export interface SyncCursor {
+  committedTimestampMs: number;
+  collectionId: string;
+  id: RowId;
+}
+
+export interface TransportPullRequest<S extends CollectionValueMap> {
+  cursor?: SyncCursor;
+  limit: number;
+  collectionId?: CollectionId<S>;
+  parentId?: RowId;
+}
+
+export interface TransportPullResponse<S extends CollectionValueMap> {
+  changes: Array<AnyStoredRow<S>>;
+  nextCursor?: SyncCursor;
+  hasMore: boolean;
+}
+
+export interface TransportPushRequest<S extends CollectionValueMap> {
+  operations: Array<PendingOperation<S>>;
+}
+
+export interface TransportPushResponse {
+  acknowledgedThroughSequence?: PendingSequence;
+}
+
+export type TransportEvent<S extends CollectionValueMap> =
+  | {
+      type: "serverChanges";
+      changes: Array<AnyStoredRow<S>>;
+    }
+  | {
+      type: "needsAuth";
+    };
+
+export interface TransportAdapter<S extends CollectionValueMap> {
+  pull(request: TransportPullRequest<S>): Promise<TransportPullResponse<S>>;
+  push(request: TransportPushRequest<S>): Promise<TransportPushResponse>;
+  onEvent(listener: (event: TransportEvent<S>) => void): () => void;
+}
+
+export interface SyncEngine {
+  start(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export type SyncEngineFactory<
+  S extends CollectionValueMap,
+  KV extends Record<string, unknown> = Record<string, unknown>,
+> = (
+  storage: Storage<S, KV>,
+  connectionManager: ConnectionManager,
+  transportAdapter: TransportAdapter<S>,
+) => Promise<SyncEngine>;
