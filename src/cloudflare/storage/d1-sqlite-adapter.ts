@@ -1,17 +1,6 @@
-import type {
-  SqliteRowRecord,
-  SqliteStatementExecutor,
-  SqliteTransactionExecutor,
-} from "../../sqlite";
+import type { SqliteStatementExecutor, SqliteTransactionExecutor } from "../../sqlite";
+import type { CollectionValueMap } from "../../core/types";
 import { SqliteRowStoreAdapter } from "../../sqlite";
-
-function assertSqlIdentifier(value: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
-    throw new Error(`Invalid SQL identifier: ${value}`);
-  }
-
-  return value;
-}
 
 function resultRows<Row>(result: D1ResultLike<Row> | undefined): Row[] {
   return Array.isArray(result?.results) ? result.results : [];
@@ -103,11 +92,10 @@ export interface CreateD1SqliteRowStoreAdapterInput {
   rowsTable?: string;
 }
 
-export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdapter<Value> {
+export class D1SqliteRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+> extends SqliteRowStoreAdapter<S> {
   readonly database: D1DatabaseLike;
-  private readonly userID: string;
-  private readonly namespace: string;
-  private readonly rowsTable: string;
 
   constructor(input: CreateD1SqliteRowStoreAdapterInput) {
     const executor = new D1SqliteTransactionExecutor(input.database);
@@ -120,39 +108,11 @@ export class D1SqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdap
     });
 
     this.database = input.database;
-    this.userID = input.userID;
-    this.namespace = input.namespace;
-    this.rowsTable = assertSqlIdentifier(input.rowsTable ?? "rows");
-  }
-
-  async getRawRow(collection: string, id: string): Promise<SqliteRowRecord | undefined> {
-    const statement = this.database
-      .prepare(
-        `SELECT
-          user_id,
-          namespace,
-          collection,
-          id,
-          parent_id,
-          value_json,
-          hlc,
-          hlc_wall_ms,
-          hlc_counter,
-          hlc_node_id,
-          tx_id,
-          tombstone
-         FROM ${this.rowsTable}
-         WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
-      )
-      .bind(this.userID, this.namespace, collection, id);
-    const [result] = await this.database.batch<SqliteRowRecord>([statement]);
-    const rows = resultRows(result);
-    return rows[0] as SqliteRowRecord | undefined;
   }
 }
 
-export function createD1SqliteRowStoreAdapter<Value = unknown>(
-  input: CreateD1SqliteRowStoreAdapterInput,
-): D1SqliteRowStoreAdapter<Value> {
-  return new D1SqliteRowStoreAdapter<Value>(input);
+export function createD1SqliteRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+>(input: CreateD1SqliteRowStoreAdapterInput): D1SqliteRowStoreAdapter<S> {
+  return new D1SqliteRowStoreAdapter<S>(input);
 }

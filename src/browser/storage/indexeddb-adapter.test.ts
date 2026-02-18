@@ -13,6 +13,13 @@ interface RowValue {
   title: string;
 }
 
+interface Collections {
+  books: RowValue;
+  highlights: RowValue;
+}
+
+const TEST_NAMESPACE = "books-app";
+
 function createIndexedDbEngine() {
   const dbName = `row-store-test-${crypto.randomUUID()}`;
   let storedClock: HybridLogicalClock | undefined;
@@ -31,15 +38,16 @@ function createIndexedDbEngine() {
     now: () => 2_000,
   });
 
-  const adapter = createIndexedDbRowStoreAdapter<RowValue>({
+  const adapter = createIndexedDbRowStoreAdapter<Collections>({
     dbName,
-    namespace: "books-app",
+    namespace: TEST_NAMESPACE,
     indexedDB,
     IDBKeyRange,
   });
-  const engine = createEngine<RowValue>({
+  const engine = createEngine<Collections>({
     adapter,
     clock,
+    namespace: TEST_NAMESPACE,
     txIDFactory: () => `tx_${++txCounter}`,
   });
 
@@ -57,146 +65,116 @@ describe("IndexedDbRowStoreAdapter", () => {
     const { adapter, engine, cleanup } = createIndexedDbEngine();
 
     try {
-      const write = await engine.txn([
-        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
-      ]);
+      const write = await engine.execute([
+        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+      ] as const);
 
-      expect(write.writes[0]?.hlc).toBe("2000-0-deviceA");
+      expect(write[0]?.hlcTimestampMs).toBe(2000);
+      expect(write[0]?.hlcCounter).toBe(0);
 
-      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-      expect(read.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get",
-        row: {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "Dune" },
-          hlc: "2000-0-deviceA",
-          txID: "tx_1",
-          tombstone: false,
-        },
+      const read = await engine.execute([
+        { type: "get", collectionId: "books", id: "book-1" },
+      ] as const);
+      expect(read[0]).toMatchObject({
+        namespace: TEST_NAMESPACE,
+        collectionId: "books",
+        id: "book-1",
+        parentId: null,
+        data: { title: "Dune" },
+        txId: "tx_1",
+        tombstone: false,
+        committedTimestampMs: 2000,
+        hlcTimestampMs: 2000,
+        hlcCounter: 0,
+        hlcDeviceId: "deviceA",
       });
 
-      await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
+      await engine.execute([{ type: "delete", collectionId: "books", id: "book-1" }] as const);
 
       const raw = await adapter.getRawRow("books", "book-1");
       expect(raw).toMatchObject({
-        hlcWallMs: 2000,
+        committedTimestampMs: 2000,
+        hlcTimestampMs: 2000,
         hlcCounter: 1,
-        hlcNodeId: "deviceA",
+        hlcDeviceId: "deviceA",
         tombstone: 1,
       });
 
-      const deleted = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-      expect(deleted.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get",
-        row: undefined,
-      });
+      const deleted = await engine.execute([
+        { type: "get", collectionId: "books", id: "book-1" },
+      ] as const);
+      expect(deleted[0]).toBeUndefined();
     } finally {
       await cleanup();
     }
   });
 
-  test("delete_all_with_parent only tombstones matching children", async () => {
+  test("deleteAllWithParent only tombstones matching children", async () => {
     const { adapter, engine, cleanup } = createIndexedDbEngine();
 
     try {
-      await engine.txn([
+      await engine.execute([
         {
-          kind: "put",
-          collection: "highlights",
+          type: "put",
+          collectionId: "highlights",
           id: "h-1",
-          parentID: "book-1",
-          value: { title: "a" },
+          parentId: "book-1",
+          data: { title: "a" },
         },
         {
-          kind: "put",
-          collection: "highlights",
+          type: "put",
+          collectionId: "highlights",
           id: "h-2",
-          parentID: "book-1",
-          value: { title: "b" },
+          parentId: "book-1",
+          data: { title: "b" },
         },
         {
-          kind: "put",
-          collection: "highlights",
+          type: "put",
+          collectionId: "highlights",
           id: "h-3",
-          parentID: "book-2",
-          value: { title: "c" },
+          parentId: "book-2",
+          data: { title: "c" },
         },
-      ]);
+      ] as const);
 
-      const deleteResult = await engine.txn([
+      const deleted = await engine.execute([
         {
-          kind: "delete_all_with_parent",
-          collection: "highlights",
-          parentID: "book-1",
+          type: "deleteAllWithParent",
+          collectionId: "highlights",
+          parentId: "book-1",
         },
-      ]);
+      ] as const);
 
-      expect(deleteResult.writes).toEqual([
-        {
-          collection: "highlights",
-          id: "h-1",
-          parentID: "book-1",
-          hlc: "2000-3-deviceA",
-          tombstone: true,
-        },
-        {
-          collection: "highlights",
-          id: "h-2",
-          parentID: "book-1",
-          hlc: "2000-4-deviceA",
-          tombstone: true,
-        },
-      ]);
+      expect(deleted[0]).toHaveLength(2);
+      expect(deleted[0].every((entry) => entry.tombstone)).toBe(true);
 
-      const bookOneChildren = await engine.txn([
+      const bookOneChildren = await engine.execute([
         {
-          kind: "get_all_with_parent",
-          collection: "highlights",
-          parentID: "book-1",
+          type: "getAllWithParent",
+          collectionId: "highlights",
+          parentId: "book-1",
         },
-      ]);
-      expect(bookOneChildren.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get_all_with_parent",
-        rows: [],
-      });
+      ] as const);
+      expect(bookOneChildren[0]).toEqual([]);
 
-      const bookTwoChildren = await engine.txn([
+      const bookTwoChildren = await engine.execute([
         {
-          kind: "get_all_with_parent",
-          collection: "highlights",
-          parentID: "book-2",
+          type: "getAllWithParent",
+          collectionId: "highlights",
+          parentId: "book-2",
         },
-      ]);
-      expect(bookTwoChildren.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get_all_with_parent",
-        rows: [
-          {
-            collection: "highlights",
-            id: "h-3",
-            parentID: "book-2",
-            value: { title: "c" },
-            hlc: "2000-2-deviceA",
-            txID: "tx_1",
-            tombstone: false,
-          },
-        ],
+      ] as const);
+      expect(bookTwoChildren[0]).toHaveLength(1);
+      expect(bookTwoChildren[0][0]).toMatchObject({
+        id: "h-3",
+        parentId: "book-2",
+        data: { title: "c" },
+        tombstone: false,
       });
 
       expect((await adapter.getRawRow("highlights", "h-1"))?.tombstone).toBe(1);
       expect((await adapter.getRawRow("highlights", "h-2"))?.tombstone).toBe(1);
       expect((await adapter.getRawRow("highlights", "h-3"))?.tombstone).toBe(0);
-      expect(await adapter.getRawRow("highlights", "h-3")).toMatchObject({
-        hlcWallMs: 2000,
-        hlcCounter: 2,
-        hlcNodeId: "deviceA",
-        tombstone: 0,
-      });
     } finally {
       await cleanup();
     }

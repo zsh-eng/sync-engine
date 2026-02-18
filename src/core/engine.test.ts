@@ -1,26 +1,62 @@
 import { describe, expect, test } from "bun:test";
 
 import { createEngine } from "./engine";
-import { createClockService, type ClockStorageAdapter, type HybridLogicalClock } from "./hlc";
-import { createInMemoryRowStoreAdapter } from "./storage/in-memory-adapter";
-import type { RowStoreOperation, StoredRow } from "./storage/types";
+import {
+  createClockService,
+  parseClock,
+  type ClockStorageAdapter,
+  type HybridLogicalClock,
+} from "./hlc";
+import { createInMemoryRowStorageAdapter } from "./storage/in-memory-adapter";
+import type { AnyStoredRow } from "./types";
 
 interface BookValue {
   title: string;
 }
 
+interface Collections {
+  books: BookValue;
+  highlights: BookValue;
+}
+
+const TEST_NAMESPACE = "books-app";
+
 function asClock(value: string): HybridLogicalClock {
   return value as HybridLogicalClock;
 }
 
-function createTestEngine(input: { seedRows?: ReadonlyArray<StoredRow<BookValue>> } = {}) {
-  let stored: HybridLogicalClock | undefined;
+function remoteRow(
+  input: Omit<
+    AnyStoredRow<Collections>,
+    "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId" | "committedTimestampMs"
+  > & {
+    clock: HybridLogicalClock;
+  },
+): AnyStoredRow<Collections> {
+  const parsed = parseClock(input.clock);
+  return {
+    namespace: input.namespace,
+    collectionId: input.collectionId,
+    id: input.id,
+    parentId: input.parentId,
+    data: input.data,
+    txId: input.txId,
+    tombstone: input.tombstone,
+    committedTimestampMs: parsed.wallMs,
+    hlcTimestampMs: parsed.wallMs,
+    hlcCounter: parsed.counter,
+    hlcDeviceId: parsed.nodeId,
+  };
+}
+
+function createTestEngine(input: { seedRows?: ReadonlyArray<AnyStoredRow<Collections>> } = {}) {
+  let storedClock: HybridLogicalClock | undefined;
   let txCounter = 0;
 
   const clockStorage: ClockStorageAdapter = {
-    read: () => stored,
+    read: () => storedClock,
     write: (clock) => {
-      stored = clock;
+      storedClock = clock;
     },
   };
 
@@ -30,470 +66,276 @@ function createTestEngine(input: { seedRows?: ReadonlyArray<StoredRow<BookValue>
     now: () => 1_000,
   });
 
-  const adapter = createInMemoryRowStoreAdapter<BookValue>({
+  const adapter = createInMemoryRowStorageAdapter<Collections>({
+    namespace: TEST_NAMESPACE,
     seedRows: input.seedRows,
   });
-  const engine = createEngine<BookValue>({
+  const engine = createEngine<Collections>({
     adapter,
     clock,
+    namespace: TEST_NAMESPACE,
     txIDFactory: () => `tx_${++txCounter}`,
   });
 
   return { engine, adapter };
 }
 
-function getResultAt(
-  result: Awaited<ReturnType<ReturnType<typeof createTestEngine>["engine"]["txn"]>>,
-  index: number,
-) {
-  const readResult = result.readResults[index];
-  if (!readResult) {
-    throw new Error(`Missing read result at index ${index}`);
-  }
-  return readResult;
-}
-
 describe("Engine core behavior", () => {
-  test("assigns HLC values to writes and returns reads in op order", async () => {
+  test("executes put/get/getAll operations", async () => {
     const { engine } = createTestEngine();
 
-    const writeResult = await engine.txn([
+    const write = await engine.execute([
       {
-        kind: "put",
-        collection: "books",
+        type: "put",
+        collectionId: "books",
         id: "book-1",
-        value: { title: "Dune" },
+        data: { title: "Dune" },
       },
-    ]);
+    ] as const);
 
-    expect(writeResult.txID).toBe("tx_1");
-    expect(writeResult.writes).toEqual([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        hlc: "1000-0-deviceA",
-        tombstone: false,
-      },
-    ]);
-
-    const readResult = await engine.txn([
-      { kind: "get", collection: "books", id: "book-1" },
-      { kind: "get_all", collection: "books" },
-    ]);
-
-    expect(readResult.txID).toBe("tx_2");
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: { title: "Dune" },
-        hlc: "1000-0-deviceA",
-        txID: "tx_1",
-        tombstone: false,
-      },
-    });
-    expect(getResultAt(readResult, 1)).toEqual({
-      opIndex: 1,
-      kind: "get_all",
-      rows: [
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "Dune" },
-          hlc: "1000-0-deviceA",
-          txID: "tx_1",
-          tombstone: false,
-        },
-      ],
-    });
-  });
-
-  test("delete and delete_all_with_parent create tombstones and hide rows from reads", async () => {
-    const { engine } = createTestEngine();
-
-    const setupOps: RowStoreOperation<BookValue>[] = [
-      { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
-      {
-        kind: "put",
-        collection: "highlights",
-        id: "h-1",
-        parentID: "book-1",
-        value: { title: "first highlight" },
-      },
-      {
-        kind: "put",
-        collection: "highlights",
-        id: "h-2",
-        parentID: "book-1",
-        value: { title: "second highlight" },
-      },
-    ];
-
-    await engine.txn(setupOps);
-
-    const deleteResult = await engine.txn([
-      { kind: "delete", collection: "books", id: "book-1" },
-      {
-        kind: "delete_all_with_parent",
-        collection: "highlights",
-        parentID: "book-1",
-      },
-    ]);
-
-    expect(deleteResult.txID).toBe("tx_2");
-    expect(deleteResult.writes).toEqual([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        hlc: "1000-3-deviceA",
-        tombstone: true,
-      },
-      {
-        collection: "highlights",
-        id: "h-1",
-        parentID: "book-1",
-        hlc: "1000-4-deviceA",
-        tombstone: true,
-      },
-      {
-        collection: "highlights",
-        id: "h-2",
-        parentID: "book-1",
-        hlc: "1000-5-deviceA",
-        tombstone: true,
-      },
-    ]);
-
-    const postDelete = await engine.txn([
-      { kind: "get", collection: "books", id: "book-1" },
-      {
-        kind: "get_all_with_parent",
-        collection: "highlights",
-        parentID: "book-1",
-      },
-      { kind: "get_all", collection: "highlights" },
-    ]);
-
-    expect(getResultAt(postDelete, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: undefined,
-    });
-    expect(getResultAt(postDelete, 1)).toEqual({
-      opIndex: 1,
-      kind: "get_all_with_parent",
-      rows: [],
-    });
-    expect(getResultAt(postDelete, 2)).toEqual({
-      opIndex: 2,
-      kind: "get_all",
-      rows: [],
-    });
-  });
-
-  test("preserves existing parentID when put omits parentID", async () => {
-    const { engine } = createTestEngine();
-
-    await engine.txn([
-      {
-        kind: "put",
-        collection: "highlights",
-        id: "h-1",
-        parentID: "book-1",
-        value: { title: "first" },
-      },
-    ]);
-
-    const updateResult = await engine.txn([
-      {
-        kind: "put",
-        collection: "highlights",
-        id: "h-1",
-        value: { title: "updated" },
-      },
-    ]);
-
-    expect(updateResult.writes).toEqual([
-      {
-        collection: "highlights",
-        id: "h-1",
-        parentID: "book-1",
-        hlc: "1000-1-deviceA",
-        tombstone: false,
-      },
-    ]);
-
-    const readResult = await engine.txn([
-      {
-        kind: "get",
-        collection: "highlights",
-        id: "h-1",
-      },
-    ]);
-
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: {
-        collection: "highlights",
-        id: "h-1",
-        parentID: "book-1",
-        value: { title: "updated" },
-        hlc: "1000-1-deviceA",
-        txID: "tx_2",
-        tombstone: false,
-      },
-    });
-  });
-
-  test("coalesces invalidation hints and notifies subscribers only for writes", async () => {
-    const { engine } = createTestEngine();
-    const notifications: string[] = [];
-
-    const unsubscribe = engine.subscribe((result) => {
-      notifications.push(
-        result.invalidationHints
-          .map((hint) => `${hint.collection}:${hint.id ?? ""}:${hint.parentID ?? ""}`)
-          .join("|"),
-      );
-    });
-
-    await engine.txn([{ kind: "get_all", collection: "books" }]);
-    expect(notifications).toEqual([]);
-
-    await engine.txn([
-      { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
-      { kind: "put", collection: "books", id: "book-1", value: { title: "Dune 2" } },
-    ]);
-
-    expect(notifications).toEqual(["books:book-1:"]);
-
-    unsubscribe();
-    await engine.txn([
-      { kind: "put", collection: "books", id: "book-2", value: { title: "Children of Dune" } },
-    ]);
-
-    expect(notifications).toEqual(["books:book-1:"]);
-  });
-
-  test("skips stale puts when existing row has newer HLC", async () => {
-    const existingRow: StoredRow<BookValue> = {
-      collection: "books",
+    expect(write[0]).toEqual({
+      collectionId: "books",
       id: "book-1",
-      parentID: null,
-      value: { title: "Remote winner" },
-      hlc: asClock("9000-0-deviceZ"),
-      txID: "tx_remote",
+      parentId: null,
+      committedTimestampMs: 1000,
+      hlcTimestampMs: 1000,
+      hlcCounter: 0,
+      hlcDeviceId: "deviceA",
       tombstone: false,
-    };
-    const { engine } = createTestEngine({
-      seedRows: [existingRow],
+      applied: true,
     });
 
-    const writeResult = await engine.txn([
+    const read = await engine.execute([
+      { type: "get", collectionId: "books", id: "book-1" },
+      { type: "getAll", collectionId: "books" },
+    ] as const);
+
+    expect(read[0]).toEqual({
+      namespace: TEST_NAMESPACE,
+      collectionId: "books",
+      id: "book-1",
+      parentId: null,
+      data: { title: "Dune" },
+      txId: "tx_1",
+      tombstone: false,
+      committedTimestampMs: 1000,
+      hlcTimestampMs: 1000,
+      hlcCounter: 0,
+      hlcDeviceId: "deviceA",
+    });
+    expect(read[1]).toHaveLength(1);
+  });
+
+  test("delete and deleteAllWithParent create tombstones and hide rows from reads", async () => {
+    const { engine } = createTestEngine();
+
+    await engine.execute([
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
       {
-        kind: "put",
-        collection: "books",
-        id: "book-1",
-        value: { title: "Local stale write" },
+        type: "put",
+        collectionId: "highlights",
+        id: "h-1",
+        parentId: "book-1",
+        data: { title: "first highlight" },
       },
-    ]);
+      {
+        type: "put",
+        collectionId: "highlights",
+        id: "h-2",
+        parentId: "book-1",
+        data: { title: "second highlight" },
+      },
+    ] as const);
 
-    expect(writeResult.writes).toEqual([]);
-    expect(writeResult.invalidationHints).toEqual([]);
+    const deleted = await engine.execute([
+      { type: "delete", collectionId: "books", id: "book-1" },
+      { type: "deleteAllWithParent", collectionId: "highlights", parentId: "book-1" },
+    ] as const);
 
-    const readResult = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: existingRow,
+    expect(deleted[0]?.tombstone).toBe(true);
+    expect(deleted[1]).toHaveLength(2);
+    expect(deleted[1].every((entry) => entry.tombstone)).toBe(true);
+
+    const postDelete = await engine.execute([
+      { type: "get", collectionId: "books", id: "book-1" },
+      { type: "getAllWithParent", collectionId: "highlights", parentId: "book-1" },
+      { type: "getAll", collectionId: "highlights" },
+    ] as const);
+
+    expect(postDelete[0]).toBeUndefined();
+    expect(postDelete[1]).toEqual([]);
+    expect(postDelete[2]).toEqual([]);
+  });
+
+  test("preserves parentId when put omits parentId", async () => {
+    const { engine } = createTestEngine();
+
+    await engine.execute([
+      {
+        type: "put",
+        collectionId: "highlights",
+        id: "h-1",
+        parentId: "book-1",
+        data: { title: "first" },
+      },
+    ] as const);
+
+    const update = await engine.execute([
+      {
+        type: "put",
+        collectionId: "highlights",
+        id: "h-1",
+        data: { title: "updated" },
+      },
+    ] as const);
+
+    expect(update[0]?.parentId).toBe("book-1");
+
+    const read = await engine.execute([
+      {
+        type: "get",
+        collectionId: "highlights",
+        id: "h-1",
+      },
+    ] as const);
+
+    expect(read[0]).toMatchObject({
+      collectionId: "highlights",
+      id: "h-1",
+      parentId: "book-1",
+      data: { title: "updated" },
+      txId: "tx_2",
+      tombstone: false,
     });
   });
 
-  test("skips stale deletes when existing row has newer HLC", async () => {
-    const existingRow: StoredRow<BookValue> = {
-      collection: "books",
+  test("skips stale local writes when existing row has newer HLC", async () => {
+    const existing = remoteRow({
+      namespace: TEST_NAMESPACE,
+      collectionId: "books",
       id: "book-1",
-      parentID: null,
-      value: { title: "Remote winner" },
-      hlc: asClock("9000-0-deviceZ"),
-      txID: "tx_remote",
+      parentId: null,
+      data: { title: "Remote winner" },
+      txId: "tx_remote",
       tombstone: false,
-    };
-    const { engine } = createTestEngine({
-      seedRows: [existingRow],
+      clock: asClock("9000-0-deviceZ"),
     });
+    const { engine } = createTestEngine({ seedRows: [existing] });
 
-    const deleteResult = await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
+    const write = await engine.execute([
+      {
+        type: "put",
+        collectionId: "books",
+        id: "book-1",
+        data: { title: "Local stale write" },
+      },
+    ] as const);
 
-    expect(deleteResult.writes).toEqual([]);
-    expect(deleteResult.invalidationHints).toEqual([]);
+    expect(write[0]?.applied).toBe(false);
 
-    const readResult = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: existingRow,
-    });
+    const read = await engine.execute([
+      { type: "get", collectionId: "books", id: "book-1" },
+    ] as const);
+    expect(read[0]).toMatchObject(existing);
   });
 });
 
 describe("Engine applyRemote", () => {
-  test("applies remote rows with newer HLC", async () => {
+  test("applies newer remote rows and rejects older ones", async () => {
     const { engine } = createTestEngine();
 
-    await engine.txn([
-      { kind: "put", collection: "books", id: "book-1", value: { title: "Local" } },
-    ]);
+    await engine.execute([
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "Local" } },
+    ] as const);
 
-    const result = await engine.applyRemote([
-      {
-        collection: "books",
+    const applied = await engine.applyRemote([
+      remoteRow({
+        namespace: TEST_NAMESPACE,
+        collectionId: "books",
         id: "book-1",
-        parentID: null,
-        value: { title: "Remote update" },
-        hlc: asClock("5000-0-deviceB"),
-        txID: "tx_remote",
+        parentId: null,
+        data: { title: "Remote update" },
+        txId: "tx_remote_new",
         tombstone: false,
-      },
+        clock: asClock("5000-0-deviceB"),
+      }),
     ]);
+    expect(applied.appliedCount).toBe(1);
 
-    expect(result.appliedCount).toBe(1);
-    expect(result.invalidationHints).toEqual([{ collection: "books", id: "book-1" }]);
-
-    const readResult = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: {
-        collection: "books",
+    const stale = await engine.applyRemote([
+      remoteRow({
+        namespace: TEST_NAMESPACE,
+        collectionId: "books",
         id: "book-1",
-        parentID: null,
-        value: { title: "Remote update" },
-        hlc: "5000-0-deviceB",
-        txID: "tx_remote",
+        parentId: null,
+        data: { title: "Remote stale" },
+        txId: "tx_remote_old",
         tombstone: false,
-      },
+        clock: asClock("1000-0-deviceA"),
+      }),
+    ]);
+    expect(stale.appliedCount).toBe(0);
+
+    const read = await engine.execute([
+      { type: "get", collectionId: "books", id: "book-1" },
+    ] as const);
+    expect(read[0]).toMatchObject({
+      data: { title: "Remote update" },
+      txId: "tx_remote_new",
     });
   });
 
-  test("rejects remote rows with older HLC", async () => {
+  test("tracks pending operations with sequence-based ack", async () => {
     const { engine } = createTestEngine();
 
-    await engine.applyRemote([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: { title: "Newer remote" },
-        hlc: asClock("9000-0-deviceZ"),
-        txID: "tx_remote_1",
-        tombstone: false,
-      },
-    ]);
+    await engine.execute([
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+      { type: "put", collectionId: "books", id: "book-2", data: { title: "Messiah" } },
+      { type: "delete", collectionId: "books", id: "book-1" },
+    ] as const);
 
-    const result = await engine.applyRemote([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: { title: "Older remote" },
-        hlc: asClock("1000-0-deviceA"),
-        txID: "tx_remote_2",
-        tombstone: false,
-      },
-    ]);
+    const pending = await engine.getPending(10);
+    expect(pending).toHaveLength(3);
+    expect(pending.map((operation) => operation.sequence)).toEqual([1, 2, 3]);
 
-    expect(result.appliedCount).toBe(0);
-    expect(result.invalidationHints).toEqual([]);
-
-    const readResult = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: { title: "Newer remote" },
-        hlc: "9000-0-deviceZ",
-        txID: "tx_remote_1",
-        tombstone: false,
-      },
-    });
+    await engine.removePendingThrough(2);
+    const remaining = await engine.getPending(10);
+    expect(remaining.map((operation) => operation.sequence)).toEqual([3]);
   });
 
-  test("applies remote tombstones", async () => {
+  test("notifies subscribers only when rows are written", async () => {
     const { engine } = createTestEngine();
+    const events: string[] = [];
 
-    await engine.txn([
-      { kind: "put", collection: "books", id: "book-1", value: { title: "Local" } },
-    ]);
-
-    const result = await engine.applyRemote([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: null,
-        hlc: asClock("5000-0-deviceB"),
-        txID: "tx_remote",
-        tombstone: true,
-      },
-    ]);
-
-    expect(result.appliedCount).toBe(1);
-
-    const readResult = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-    expect(getResultAt(readResult, 0)).toEqual({
-      opIndex: 0,
-      kind: "get",
-      row: undefined,
-    });
-  });
-
-  test("notifies subscribers on remote apply", async () => {
-    const { engine } = createTestEngine();
-    const notifications: string[] = [];
-
-    engine.subscribe((result) => {
-      notifications.push(
-        result.invalidationHints
-          .map((hint) => `${hint.collection}:${hint.id ?? ""}:${hint.parentID ?? ""}`)
-          .join("|"),
+    engine.subscribe((event) => {
+      events.push(
+        `${event.source}:${event.invalidationHints
+          .map((hint) => `${hint.collectionId}:${hint.id ?? ""}:${hint.parentId ?? ""}`)
+          .join("|")}`,
       );
     });
 
+    await engine.execute([{ type: "getAll", collectionId: "books" }] as const);
+    expect(events).toEqual([]);
+
+    await engine.execute([
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "A" } },
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "B" } },
+    ] as const);
+
     await engine.applyRemote([
-      {
-        collection: "books",
-        id: "book-1",
-        parentID: null,
-        value: { title: "Remote" },
-        hlc: asClock("5000-0-deviceB"),
-        txID: "tx_remote",
+      remoteRow({
+        namespace: TEST_NAMESPACE,
+        collectionId: "books",
+        id: "book-2",
+        parentId: null,
+        data: { title: "Remote" },
+        txId: "tx_remote",
         tombstone: false,
-      },
+        clock: asClock("5000-0-deviceB"),
+      }),
     ]);
 
-    expect(notifications).toEqual(["books:book-1:"]);
-  });
-
-  test("does not notify subscribers when no rows are applied", async () => {
-    const { engine } = createTestEngine();
-    const notifications: string[] = [];
-
-    engine.subscribe((result) => {
-      notifications.push("notified");
-    });
-
-    await engine.applyRemote([]);
-    expect(notifications).toEqual([]);
+    expect(events).toEqual(["local:books:book-1:", "remote:books:book-2:"]);
   });
 });

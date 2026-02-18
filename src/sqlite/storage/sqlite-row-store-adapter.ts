@@ -1,17 +1,21 @@
-import { formatClock, parseClock } from "../../core/hlc";
 import type {
-  RowStoreAdapter,
-  RowStoreAdapterTransaction,
+  AnyStoredRow,
+  CollectionId,
+  CollectionValueMap,
+  PendingOperation,
+  PendingSequence,
+  RowApplyOutcome,
+  RowId,
+  RowStorageAdapter,
   StoredRow,
-  WriteOutcome,
-} from "../../core/storage/types";
+} from "../../core/types";
 
 const DEFAULT_ROWS_TABLE = "rows";
 const ROW_BIND_PARAMETER_COUNT = 12;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 90;
 
-function rowKey(collection: string, id: string): string {
-  return `${collection}::${id}`;
+function rowKey(collectionId: string, id: string): string {
+  return `${collectionId}::${id}`;
 }
 
 function assertNamespace(value: string): string {
@@ -60,6 +64,19 @@ function toValueJson(value: unknown): string {
   return encoded;
 }
 
+function clonePendingOperation<S extends CollectionValueMap>(
+  operation: PendingOperation<S>,
+): PendingOperation<S> {
+  if (operation.type === "put") {
+    return {
+      ...operation,
+      data: structuredClone(operation.data),
+    };
+  }
+
+  return { ...operation };
+}
+
 export interface SqliteRowRecord {
   user_id: string;
   namespace: string;
@@ -67,11 +84,11 @@ export interface SqliteRowRecord {
   id: string;
   parent_id: string | null;
   value_json: string | null;
-  hlc: string;
+  committed_timestamp_ms: number;
   hlc_wall_ms: number;
   hlc_counter: number;
   hlc_node_id: string;
-  tx_id: string;
+  tx_id: string | null;
   tombstone: 0 | 1;
 }
 
@@ -96,15 +113,15 @@ interface CreateSqliteRowStoreAdapterInput {
 }
 
 interface EncodedSqliteRow {
-  collection: string;
+  collectionId: string;
   id: string;
-  parentID: string | null;
+  parentId: string | null;
   valueJson: string | null;
-  hlc: string;
-  hlcWallMs: number;
+  committedTimestampMs: number;
+  hlcTimestampMs: number;
   hlcCounter: number;
-  hlcNodeId: string;
-  txID: string;
+  hlcDeviceId: string;
+  txId: string | null;
   tombstone: 0 | 1;
 }
 
@@ -112,45 +129,48 @@ interface UpsertReturningRow {
   collection: string;
   id: string;
   parent_id: string | null;
-  hlc: string;
-  tx_id: string;
+  committed_timestamp_ms: number;
+  hlc_wall_ms: number;
+  hlc_counter: number;
+  hlc_node_id: string;
   tombstone: 0 | 1;
 }
 
-function toStoredRow<Value>(row: SqliteRowRecord): StoredRow<Value> {
-  const hlcWallMs = Number(row.hlc_wall_ms);
+function toStoredRow<S extends CollectionValueMap>(row: SqliteRowRecord): AnyStoredRow<S> {
+  const committedTimestampMs = Number(row.committed_timestamp_ms);
+  const hlcTimestampMs = Number(row.hlc_wall_ms);
   const hlcCounter = Number(row.hlc_counter);
 
-  assertFiniteInteger(hlcWallMs, "hlc_wall_ms");
+  assertFiniteInteger(committedTimestampMs, "committed_timestamp_ms");
+  assertFiniteInteger(hlcTimestampMs, "hlc_wall_ms");
   assertFiniteInteger(hlcCounter, "hlc_counter");
 
   return {
-    collection: row.collection,
+    namespace: row.namespace,
+    collectionId: row.collection as CollectionId<S>,
     id: row.id,
-    parentID: row.parent_id,
-    value: row.value_json === null ? null : parseValueJson<Value>(row.value_json),
-    hlc: formatClock({
-      wallMs: hlcWallMs,
-      counter: hlcCounter,
-      nodeId: row.hlc_node_id,
-    }) as StoredRow<Value>["hlc"],
-    txID: row.tx_id,
+    parentId: row.parent_id,
+    data: row.value_json === null ? null : parseValueJson(row.value_json),
     tombstone: row.tombstone === 1,
+    txId: row.tx_id ?? undefined,
+    committedTimestampMs,
+    hlcTimestampMs,
+    hlcCounter,
+    hlcDeviceId: row.hlc_node_id,
   };
 }
 
-function toEncodedSqliteRow<Value>(row: StoredRow<Value>): EncodedSqliteRow {
-  const parsedClock = parseClock(row.hlc);
+function toEncodedSqliteRow<S extends CollectionValueMap>(row: AnyStoredRow<S>): EncodedSqliteRow {
   return {
-    collection: row.collection,
+    collectionId: row.collectionId,
     id: row.id,
-    parentID: row.parentID,
-    valueJson: row.value === null ? null : toValueJson(row.value),
-    hlc: row.hlc,
-    hlcWallMs: parsedClock.wallMs,
-    hlcCounter: parsedClock.counter,
-    hlcNodeId: parsedClock.nodeId,
-    txID: row.txID,
+    parentId: row.parentId,
+    valueJson: row.data === null ? null : toValueJson(row.data),
+    committedTimestampMs: row.committedTimestampMs,
+    hlcTimestampMs: row.hlcTimestampMs,
+    hlcCounter: row.hlcCounter,
+    hlcDeviceId: row.hlcDeviceId,
+    txId: row.txId ?? null,
     tombstone: row.tombstone ? 1 : 0,
   };
 }
@@ -164,11 +184,11 @@ function createRowsSchemaStatements(rowsTable: string): string[] {
       id TEXT NOT NULL,
       parent_id TEXT,
       value_json TEXT,
-      hlc TEXT NOT NULL,
+      committed_timestamp_ms INTEGER NOT NULL,
       hlc_wall_ms INTEGER NOT NULL,
       hlc_counter INTEGER NOT NULL,
       hlc_node_id TEXT NOT NULL,
-      tx_id TEXT NOT NULL,
+      tx_id TEXT,
       tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
       PRIMARY KEY (user_id, namespace, collection, id)
     )`,
@@ -176,6 +196,7 @@ function createRowsSchemaStatements(rowsTable: string): string[] {
     `CREATE INDEX IF NOT EXISTS ${rowsTable}_user_namespace_collection_idx ON ${rowsTable} (user_id, namespace, collection)`,
     `CREATE INDEX IF NOT EXISTS ${rowsTable}_user_namespace_collection_parent_idx ON ${rowsTable} (user_id, namespace, collection, parent_id)`,
     `CREATE INDEX IF NOT EXISTS ${rowsTable}_user_namespace_collection_tombstone_idx ON ${rowsTable} (user_id, namespace, collection, tombstone)`,
+    `CREATE INDEX IF NOT EXISTS ${rowsTable}_user_namespace_committed_idx ON ${rowsTable} (user_id, namespace, committed_timestamp_ms, collection, id)`,
     `CREATE INDEX IF NOT EXISTS ${rowsTable}_user_namespace_hlc_idx ON ${rowsTable} (user_id, namespace, hlc_wall_ms, hlc_counter, hlc_node_id)`,
   ];
 }
@@ -184,7 +205,9 @@ export function createSqliteRowStoreSchemaStatements(rowsTable = DEFAULT_ROWS_TA
   return createRowsSchemaStatements(assertSqlIdentifier(rowsTable));
 }
 
-export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
+export class SqliteRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+> implements RowStorageAdapter<S> {
   private readonly executor: SqliteTransactionExecutor;
   private readonly userID: string;
   private readonly namespace: string;
@@ -193,6 +216,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
   private readonly upsertStatementHead: string;
   private readonly upsertStatementTail: string;
   private readonly maxRowsPerStatement: number;
+  private readonly pendingOperations: PendingOperation<S>[] = [];
 
   private schemaReady: Promise<void> | undefined;
   private queue: Promise<void> = Promise.resolve();
@@ -210,7 +234,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
       "id",
       "parent_id",
       "value_json",
-      "hlc",
+      "committed_timestamp_ms",
       "hlc_wall_ms",
       "hlc_counter",
       "hlc_node_id",
@@ -224,7 +248,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
       id,
       parent_id,
       value_json,
-      hlc,
+      committed_timestamp_ms,
       hlc_wall_ms,
       hlc_counter,
       hlc_node_id,
@@ -234,7 +258,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
     this.upsertStatementTail = `ON CONFLICT(user_id, namespace, collection, id) DO UPDATE SET
       parent_id = excluded.parent_id,
       value_json = excluded.value_json,
-      hlc = excluded.hlc,
+      committed_timestamp_ms = excluded.committed_timestamp_ms,
       hlc_wall_ms = excluded.hlc_wall_ms,
       hlc_counter = excluded.hlc_counter,
       hlc_node_id = excluded.hlc_node_id,
@@ -251,47 +275,111 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
         AND excluded.hlc_counter = ${this.rowsTable}.hlc_counter
         AND excluded.hlc_node_id > ${this.rowsTable}.hlc_node_id
       )
-    RETURNING collection, id, parent_id, hlc, tx_id, tombstone`;
+    RETURNING collection, id, parent_id, committed_timestamp_ms, hlc_wall_ms, hlc_counter, hlc_node_id, tombstone`;
   }
 
-  async txn<Result>(
-    runner: (tx: RowStoreAdapterTransaction<Value>) => Promise<Result>,
-  ): Promise<Result> {
+  async get<C extends CollectionId<S>>(
+    collectionId: C,
+    id: RowId,
+  ): Promise<StoredRow<S, C> | undefined> {
+    return this.enqueue(async () => {
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        const row = await sql.get<SqliteRowRecord>(
+          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
+          [this.userID, this.namespace, collectionId, id],
+        );
+        return row ? (toStoredRow<S>(row) as StoredRow<S, C>) : undefined;
+      });
+    });
+  }
+
+  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
+    return this.enqueue(async () => {
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        const rows = await sql.all<SqliteRowRecord>(
+          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ?`,
+          [this.userID, this.namespace, collectionId],
+        );
+        return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
+      });
+    });
+  }
+
+  async getAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StoredRow<S, C>>> {
+    return this.enqueue(async () => {
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        const rows = await sql.all<SqliteRowRecord>(
+          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND parent_id = ?`,
+          [this.userID, this.namespace, collectionId, parentId],
+        );
+        return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
+      });
+    });
+  }
+
+  async applyRows(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<Array<RowApplyOutcome<S>>> {
+    if (rows.length === 0) {
+      return [];
+    }
+
     return this.enqueue(async () => {
       await this.ensureSchema();
 
       return this.executor.transaction(async (sql) => {
-        const tx: RowStoreAdapterTransaction<Value> = {
-          getAll: async (collection) => {
-            const rows = await sql.all<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ?`,
-              [this.userID, this.namespace, collection],
+        for (const row of rows) {
+          if (row.namespace !== this.namespace) {
+            throw new Error(
+              `Namespace mismatch: adapter namespace is "${this.namespace}" but received "${row.namespace}"`,
             );
-            return rows.map((row) => toStoredRow<Value>(row));
-          },
+          }
+        }
 
-          get: async (collection, id) => {
-            const row = await sql.get<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
-              [this.userID, this.namespace, collection, id],
-            );
-            return row ? toStoredRow<Value>(row) : undefined;
-          },
+        return this.applyRowsInternal(sql, rows);
+      });
+    });
+  }
 
-          getAllWithParent: async (collection, parentID) => {
-            const rows = await sql.all<SqliteRowRecord>(
-              `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND parent_id = ?`,
-              [this.userID, this.namespace, collection, parentID],
-            );
-            return rows.map((row) => toStoredRow<Value>(row));
-          },
+  async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
+    await this.enqueue(async () => {
+      for (const operation of operations) {
+        this.pendingOperations.push(clonePendingOperation(operation));
+      }
+      this.pendingOperations.sort((a, b) => a.sequence - b.sequence);
+    });
+  }
 
-          applyRows: async (rows) => {
-            return this.applyRows(sql, rows);
-          },
-        };
+  async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
+    return this.enqueue(async () => {
+      return this.pendingOperations
+        .slice(0, Math.max(0, limit))
+        .map((operation) => clonePendingOperation(operation));
+    });
+  }
 
-        return runner(tx);
+  async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
+    await this.enqueue(async () => {
+      for (let index = this.pendingOperations.length - 1; index >= 0; index -= 1) {
+        if (this.pendingOperations[index]!.sequence <= sequenceInclusive) {
+          this.pendingOperations.splice(index, 1);
+        }
+      }
+    });
+  }
+
+  async getRawRow(collectionId: string, id: string): Promise<SqliteRowRecord | undefined> {
+    return this.enqueue(async () => {
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        return sql.get<SqliteRowRecord>(
+          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
+          [this.userID, this.namespace, collectionId, id],
+        );
       });
     });
   }
@@ -330,10 +418,10 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
     }
   }
 
-  private async applyRows(
+  private async applyRowsInternal(
     sql: SqliteStatementExecutor,
-    rows: ReadonlyArray<StoredRow<Value>>,
-  ): Promise<WriteOutcome[]> {
+    rows: ReadonlyArray<AnyStoredRow<S>>,
+  ): Promise<Array<RowApplyOutcome<S>>> {
     if (rows.length === 0) {
       return [];
     }
@@ -348,11 +436,13 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
 
       for (const returned of returnedRows) {
         const signature = this.rowSignature({
-          collection: returned.collection,
+          collectionId: returned.collection,
           id: returned.id,
-          parentID: returned.parent_id,
-          hlc: returned.hlc as StoredRow<Value>["hlc"],
-          txID: returned.tx_id,
+          parentId: returned.parent_id,
+          committedTimestampMs: Number(returned.committed_timestamp_ms),
+          hlcTimestampMs: Number(returned.hlc_wall_ms),
+          hlcCounter: Number(returned.hlc_counter),
+          hlcDeviceId: returned.hlc_node_id,
           tombstone: returned.tombstone === 1,
         });
         returningCounts.set(signature, (returningCounts.get(signature) ?? 0) + 1);
@@ -374,10 +464,13 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
 
       return {
         written,
-        collection: row.collection,
+        collectionId: row.collectionId,
         id: row.id,
-        parentID: row.parentID,
-        hlc: row.hlc,
+        parentId: row.parentId,
+        committedTimestampMs: row.committedTimestampMs,
+        hlcTimestampMs: row.hlcTimestampMs,
+        hlcCounter: row.hlcCounter,
+        hlcDeviceId: row.hlcDeviceId,
         tombstone: row.tombstone,
       };
     });
@@ -397,7 +490,7 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
     params: unknown[];
   } {
     const placeholders = rows
-      .map(() => `(${new Array(ROW_BIND_PARAMETER_COUNT).fill("?").join(", ")})`)
+      .map(() => `(${Array.from({ length: ROW_BIND_PARAMETER_COUNT }, () => "?").join(", ")})`)
       .join(", ");
     const params: unknown[] = [];
 
@@ -405,15 +498,15 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
       params.push(
         this.userID,
         this.namespace,
-        row.collection,
+        row.collectionId,
         row.id,
-        row.parentID,
+        row.parentId,
         row.valueJson,
-        row.hlc,
-        row.hlcWallMs,
+        row.committedTimestampMs,
+        row.hlcTimestampMs,
         row.hlcCounter,
-        row.hlcNodeId,
-        row.txID,
+        row.hlcDeviceId,
+        row.txId,
         row.tombstone,
       );
     }
@@ -425,18 +518,22 @@ export class SqliteRowStoreAdapter<Value = unknown> implements RowStoreAdapter<V
   }
 
   private rowSignature(row: {
-    collection: string;
+    collectionId: string;
     id: string;
-    parentID: string | null;
-    hlc: StoredRow<Value>["hlc"];
-    txID: string;
+    parentId: string | null;
+    committedTimestampMs: number;
+    hlcTimestampMs: number;
+    hlcCounter: number;
+    hlcDeviceId: string;
     tombstone: boolean;
   }): string {
     return JSON.stringify([
-      rowKey(row.collection, row.id),
-      row.parentID,
-      row.hlc,
-      row.txID,
+      rowKey(row.collectionId, row.id),
+      row.parentId,
+      row.committedTimestampMs,
+      row.hlcTimestampMs,
+      row.hlcCounter,
+      row.hlcDeviceId,
       row.tombstone ? 1 : 0,
     ]);
   }

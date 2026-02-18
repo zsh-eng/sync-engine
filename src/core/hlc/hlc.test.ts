@@ -65,7 +65,7 @@ describe("HLC stateless functions", () => {
       nowMs: 99,
     });
 
-    expect(clock).toBe("99-0-local");
+    expect(clock).toBe(asClock("99-0-local"));
   });
 
   test("nextClockFromRemote advances from remote when remote dominates", () => {
@@ -76,7 +76,7 @@ describe("HLC stateless functions", () => {
       nowMs: 105,
     });
 
-    expect(clock).toBe("110-5-local");
+    expect(clock).toBe(asClock("110-5-local"));
   });
 
   test("nextClockFromRemote advances from local when local dominates", () => {
@@ -87,7 +87,7 @@ describe("HLC stateless functions", () => {
       nowMs: 115,
     });
 
-    expect(clock).toBe("120-5-local");
+    expect(clock).toBe(asClock("120-5-local"));
   });
 
   test("nextClockFromRemote takes max counter when local and remote walls tie", () => {
@@ -98,7 +98,7 @@ describe("HLC stateless functions", () => {
       nowMs: 118,
     });
 
-    expect(clock).toBe("120-8-local");
+    expect(clock).toBe(asClock("120-8-local"));
   });
 
   test("nextClockFromRemote uses now when now dominates", () => {
@@ -109,7 +109,7 @@ describe("HLC stateless functions", () => {
       nowMs: 150,
     });
 
-    expect(clock).toBe("150-0-local");
+    expect(clock).toBe(asClock("150-0-local"));
   });
 
   test("nextClockFromRemote works with no prior local clock", () => {
@@ -119,7 +119,7 @@ describe("HLC stateless functions", () => {
       nowMs: 40,
     });
 
-    expect(clock).toBe("42-9-local");
+    expect(clock).toBe(asClock("42-9-local"));
   });
 });
 
@@ -139,10 +139,10 @@ describe("HLC service", () => {
     const service = createClockService({ nodeId: "local", storage, now: () => 100 });
 
     expect(await service.peek()).toBeUndefined();
-    expect(await service.next()).toBe("100-0-local");
-    expect(await service.next()).toBe("100-1-local");
-    expect(await service.peek()).toBe("100-1-local");
-    expect(stored).toBe("100-1-local");
+    expect(await service.next()).toBe(asClock("100-0-local"));
+    expect(await service.next()).toBe(asClock("100-1-local"));
+    expect(await service.peek()).toBe(asClock("100-1-local"));
+    expect(stored).toBe(asClock("100-1-local"));
     expect(writes).toBe(2);
   });
 
@@ -157,13 +157,13 @@ describe("HLC service", () => {
     };
 
     const first = createClockService({ nodeId: "local", storage, now: () => 100 });
-    expect(await first.next()).toBe("100-0-local");
+    expect(await first.next()).toBe(asClock("100-0-local"));
 
     const second = createClockService({ nodeId: "local", storage, now: () => 120 });
     const merged = await second.nextFromRemote(asClock("150-4-remote"));
 
-    expect(merged).toBe("150-5-local");
-    expect(await second.peek()).toBe("150-5-local");
+    expect(merged).toBe(asClock("150-5-local"));
+    expect(await second.peek()).toBe(asClock("150-5-local"));
   });
 
   test("nextBatch returns the next N clocks and persists the latest", async () => {
@@ -181,9 +181,14 @@ describe("HLC service", () => {
     const service = createClockService({ nodeId: "local", storage, now: () => 300 });
 
     const batch = await service.nextBatch(4);
-    expect(batch).toEqual(["300-0-local", "300-1-local", "300-2-local", "300-3-local"]);
-    expect(await service.peek()).toBe("300-3-local");
-    expect(stored).toBe("300-3-local");
+    expect(batch).toEqual([
+      asClock("300-0-local"),
+      asClock("300-1-local"),
+      asClock("300-2-local"),
+      asClock("300-3-local"),
+    ]);
+    expect(await service.peek()).toBe(asClock("300-3-local"));
+    expect(stored).toBe(asClock("300-3-local"));
     expect(writes).toBe(1);
   });
 
@@ -222,12 +227,12 @@ describe("HLC service", () => {
     ]);
 
     expect(results).toEqual([
-      "200-0-local",
-      "200-1-local",
-      "200-2-local",
-      "200-3-local",
-      "200-4-local",
+      asClock("200-0-local"),
+      asClock("200-1-local"),
+      asClock("200-2-local"),
+      asClock("200-3-local"),
+      asClock("200-4-local"),
     ]);
-    expect(await service.peek()).toBe("200-4-local");
+    expect(await service.peek()).toBe(asClock("200-4-local"));
   });
 });

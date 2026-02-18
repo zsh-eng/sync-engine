@@ -1,14 +1,23 @@
 export type {
-  RowStoreAdapter,
-  RowStoreAdapterTransaction,
-  RowStoreInvalidationHint,
-  RowStoreListener,
-  RowStoreOperation,
-  RowStoreReadResult,
-  RowStoreTxnResult,
-  RowStoreWriteResult,
+  AnyStoredRow,
+  CollectionId,
+  CollectionValueMap,
+  PendingOperation,
+  PendingSequence,
+  RowApplyOutcome,
+  RowId,
+  RowStorageAdapter,
   StoredRow,
-  WriteOutcome,
-} from "./types";
+  Storage,
+  StorageFactory,
+  StorageOp,
+  StorageResult,
+  StorageResults,
+  StorageWriteResult,
+} from "../types";
 
-export { createInMemoryRowStoreAdapter, InMemoryRowStoreAdapter } from "./in-memory-adapter";
+export {
+  createInMemoryRowStorageAdapter,
+  InMemoryRowStorageAdapter,
+  type CreateInMemoryRowStorageAdapterInput,
+} from "./in-memory-adapter";

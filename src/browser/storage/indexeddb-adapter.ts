@@ -1,28 +1,65 @@
 import Dexie, { type Table } from "dexie";
 
-import { compareClocks, formatClock, parseClock } from "../../core/hlc";
 import type {
-  RowStoreAdapter,
-  RowStoreAdapterTransaction,
+  AnyStoredRow,
+  CollectionId,
+  CollectionValueMap,
+  PendingOperation,
+  PendingSequence,
+  RowApplyOutcome,
+  RowId,
+  RowStorageAdapter,
   StoredRow,
-  WriteOutcome,
-} from "../../core/storage/types";
+} from "../../core/types";
 
-export interface IndexedDbRowRecord<Value = unknown> {
+function compareHlc(
+  a: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
+  b: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
+): -1 | 0 | 1 {
+  if (a.hlcTimestampMs !== b.hlcTimestampMs) {
+    return a.hlcTimestampMs < b.hlcTimestampMs ? -1 : 1;
+  }
+
+  if (a.hlcCounter !== b.hlcCounter) {
+    return a.hlcCounter < b.hlcCounter ? -1 : 1;
+  }
+
+  if (a.hlcDeviceId === b.hlcDeviceId) {
+    return 0;
+  }
+
+  return a.hlcDeviceId < b.hlcDeviceId ? -1 : 1;
+}
+
+function clonePendingOperation<S extends CollectionValueMap>(
+  operation: PendingOperation<S>,
+): PendingOperation<S> {
+  if (operation.type === "put") {
+    return {
+      ...operation,
+      data: structuredClone(operation.data),
+    };
+  }
+
+  return { ...operation };
+}
+
+export interface IndexedDbRowRecord<S extends CollectionValueMap = Record<string, unknown>> {
   namespace: string;
-  collection: string;
+  collectionId: CollectionId<S>;
   id: string;
-  parentID: string | null;
-  value: Value | null;
-  hlcWallMs: number;
+  parentId: string | null;
+  data: unknown | null;
+  committedTimestampMs: number;
+  hlcTimestampMs: number;
   hlcCounter: number;
-  hlcNodeId: string;
-  txID: string;
+  hlcDeviceId: string;
+  txId: string | null;
   tombstone: 0 | 1;
 }
 
-class RowStoreDexieDatabase<Value = unknown> extends Dexie {
-  readonly rows!: Table<IndexedDbRowRecord<Value>, [string, string, string]>;
+class RowStoreDexieDatabase<S extends CollectionValueMap = Record<string, unknown>> extends Dexie {
+  readonly rows!: Table<IndexedDbRowRecord<S>, [string, string, string]>;
 
   constructor(
     name: string,
@@ -34,7 +71,7 @@ class RowStoreDexieDatabase<Value = unknown> extends Dexie {
     super(name, options);
 
     this.version(1).stores({
-      rows: "&[namespace+collection+id], [namespace+collection], [namespace+collection+parentID], [namespace+collection+tombstone], [namespace+collection+parentID+tombstone], [namespace+hlcWallMs+hlcCounter], [namespace+hlcWallMs+hlcCounter+hlcNodeId], [namespace+collection+hlcWallMs+hlcCounter+hlcNodeId]",
+      rows: "&[namespace+collectionId+id], [namespace+collectionId], [namespace+collectionId+parentId], [namespace+collectionId+tombstone], [namespace+committedTimestampMs+collectionId+id], [namespace+hlcTimestampMs+hlcCounter+hlcDeviceId]",
     });
   }
 }
@@ -47,37 +84,37 @@ function assertNamespace(value: string): string {
   return value;
 }
 
-function toStoredRow<Value>(row: IndexedDbRowRecord<Value>): StoredRow<Value> {
+function toStoredRow<S extends CollectionValueMap>(row: IndexedDbRowRecord<S>): AnyStoredRow<S> {
   return {
-    collection: row.collection,
+    namespace: row.namespace,
+    collectionId: row.collectionId,
     id: row.id,
-    parentID: row.parentID,
-    value: row.value,
-    hlc: formatClock({
-      wallMs: row.hlcWallMs,
-      counter: row.hlcCounter,
-      nodeId: row.hlcNodeId,
-    }) as StoredRow<Value>["hlc"],
-    txID: row.txID,
+    parentId: row.parentId,
+    data: row.data as AnyStoredRow<S>["data"],
     tombstone: row.tombstone === 1,
+    txId: row.txId ?? undefined,
+    committedTimestampMs: row.committedTimestampMs,
+    hlcTimestampMs: row.hlcTimestampMs,
+    hlcCounter: row.hlcCounter,
+    hlcDeviceId: row.hlcDeviceId,
   };
 }
 
-function toIndexedDbRow<Value>(
+function toIndexedDbRow<S extends CollectionValueMap>(
   namespace: string,
-  row: StoredRow<Value>,
-): IndexedDbRowRecord<Value> {
-  const parsedClock = parseClock(row.hlc);
+  row: AnyStoredRow<S>,
+): IndexedDbRowRecord<S> {
   return {
     namespace,
-    collection: row.collection,
+    collectionId: row.collectionId,
     id: row.id,
-    parentID: row.parentID,
-    value: row.value,
-    hlcWallMs: parsedClock.wallMs,
-    hlcCounter: parsedClock.counter,
-    hlcNodeId: parsedClock.nodeId,
-    txID: row.txID,
+    parentId: row.parentId,
+    data: row.data,
+    committedTimestampMs: row.committedTimestampMs,
+    hlcTimestampMs: row.hlcTimestampMs,
+    hlcCounter: row.hlcCounter,
+    hlcDeviceId: row.hlcDeviceId,
+    txId: row.txId ?? null,
     tombstone: row.tombstone ? 1 : 0,
   };
 }
@@ -89,9 +126,12 @@ export interface CreateIndexedDbRowStoreAdapterInput {
   IDBKeyRange?: typeof IDBKeyRange;
 }
 
-export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
-  private readonly db: RowStoreDexieDatabase<Value>;
+export class IndexedDbRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+> implements RowStorageAdapter<S> {
+  private readonly db: RowStoreDexieDatabase<S>;
   private readonly namespace: string;
+  private pendingOperations: PendingOperation<S>[] = [];
 
   constructor(input: CreateIndexedDbRowStoreAdapterInput) {
     const hasCustomIndexedDb = input.indexedDB !== undefined || input.IDBKeyRange !== undefined;
@@ -103,89 +143,129 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
       : undefined;
 
     this.namespace = assertNamespace(input.namespace);
-    this.db = new RowStoreDexieDatabase<Value>(input.dbName, options);
+    this.db = new RowStoreDexieDatabase<S>(input.dbName, options);
   }
 
-  async txn<Result>(
-    runner: (tx: RowStoreAdapterTransaction<Value>) => Promise<Result>,
-  ): Promise<Result> {
+  async get<C extends CollectionId<S>>(
+    collectionId: C,
+    id: RowId,
+  ): Promise<StoredRow<S, C> | undefined> {
+    const row = await this.db.rows.get([this.namespace, collectionId, id]);
+    return row ? (toStoredRow<S>(row) as StoredRow<S, C>) : undefined;
+  }
+
+  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
+    const rows = await this.db.rows
+      .where("[namespace+collectionId]")
+      .equals([this.namespace, collectionId])
+      .toArray();
+    return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
+  }
+
+  async getAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StoredRow<S, C>>> {
+    const rows = await this.db.rows
+      .where("[namespace+collectionId+parentId]")
+      .equals([this.namespace, collectionId, parentId])
+      .toArray();
+    return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
+  }
+
+  async applyRows(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<Array<RowApplyOutcome<S>>> {
     return this.db.transaction("rw", this.db.rows, async () => {
-      return runner({
-        getAll: async (collection) => {
-          const rows = await this.db.rows
-            .where("[namespace+collection]")
-            .equals([this.namespace, collection])
-            .toArray();
-          return rows.map((row) => toStoredRow(row));
-        },
-        get: async (collection, id) => {
-          const row = await this.db.rows.get([this.namespace, collection, id]);
-          return row ? toStoredRow(row) : undefined;
-        },
-        getAllWithParent: async (collection, parentID) => {
-          const rows = await this.db.rows
-            .where("[namespace+collection+parentID]")
-            .equals([this.namespace, collection, parentID])
-            .toArray();
-          return rows.map((row) => toStoredRow(row));
-        },
-        applyRows: async (rows) => {
-          if (rows.length === 0) {
-            return [];
-          }
+      if (rows.length === 0) {
+        return [];
+      }
 
-          // Single round-trip to fetch all existing rows.
-          const keys: [string, string, string][] = rows.map((r) => [
-            this.namespace,
-            r.collection,
-            r.id,
-          ]);
-          const existingRecords = await this.db.rows.bulkGet(keys);
-          const existingByKey = new Map<string, StoredRow<Value>>();
-          for (let i = 0; i < rows.length; i++) {
-            const record = existingRecords[i];
-            if (record) {
-              existingByKey.set(
-                `${record.namespace}::${record.collection}::${record.id}`,
-                toStoredRow(record),
-              );
-            }
-          }
+      for (const row of rows) {
+        if (row.namespace !== this.namespace) {
+          throw new Error(
+            `Namespace mismatch: adapter namespace is "${this.namespace}" but received "${row.namespace}"`,
+          );
+        }
+      }
 
-          const winners = new Map<string, StoredRow<Value>>();
-          const outcomes: WriteOutcome[] = [];
+      const keys: [string, string, string][] = rows.map((row) => [
+        this.namespace,
+        row.collectionId,
+        row.id,
+      ]);
+      const existingRecords = await this.db.rows.bulkGet(keys);
+      const existingByKey = new Map<string, AnyStoredRow<S>>();
 
-          for (const row of rows) {
-            const key = `${this.namespace}::${row.collection}::${row.id}`;
-            const existing = winners.get(key) ?? existingByKey.get(key);
-            const written = !existing || compareClocks(row.hlc, existing.hlc) === 1;
-            if (written) {
-              winners.set(key, row);
-            }
-            outcomes.push({
-              written,
-              collection: row.collection,
-              id: row.id,
-              parentID: row.parentID,
-              hlc: row.hlc,
-              tombstone: row.tombstone,
-            });
-          }
+      for (let index = 0; index < rows.length; index += 1) {
+        const record = existingRecords[index];
+        if (record) {
+          existingByKey.set(
+            `${record.namespace}::${record.collectionId}::${record.id}`,
+            toStoredRow(record),
+          );
+        }
+      }
 
-          if (winners.size > 0) {
-            await this.db.rows.bulkPut(
-              [...winners.values()].map((r) => toIndexedDbRow(this.namespace, r)),
-            );
-          }
+      const winners = new Map<string, AnyStoredRow<S>>();
+      const outcomes: RowApplyOutcome<S>[] = [];
 
-          return outcomes;
-        },
-      });
+      for (const row of rows) {
+        const key = `${this.namespace}::${row.collectionId}::${row.id}`;
+        const existing = winners.get(key) ?? existingByKey.get(key);
+        const written = !existing || compareHlc(row, existing) === 1;
+
+        if (written) {
+          winners.set(key, row);
+        }
+
+        outcomes.push({
+          written,
+          collectionId: row.collectionId,
+          id: row.id,
+          parentId: row.parentId,
+          tombstone: row.tombstone,
+          committedTimestampMs: row.committedTimestampMs,
+          hlcTimestampMs: row.hlcTimestampMs,
+          hlcCounter: row.hlcCounter,
+          hlcDeviceId: row.hlcDeviceId,
+        });
+      }
+
+      if (winners.size > 0) {
+        await this.db.rows.bulkPut(
+          [...winners.values()].map((row) => toIndexedDbRow(this.namespace, row)),
+        );
+      }
+
+      return outcomes;
     });
   }
 
-  async getRawRow(collection: string, id: string): Promise<IndexedDbRowRecord<Value> | undefined> {
-    return this.db.rows.get([this.namespace, collection, id]);
+  async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
+    if (operations.length === 0) {
+      return;
+    }
+
+    for (const operation of operations) {
+      this.pendingOperations.push(clonePendingOperation(operation));
+    }
+
+    this.pendingOperations.sort((a, b) => a.sequence - b.sequence);
+  }
+
+  async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
+    return this.pendingOperations
+      .slice(0, Math.max(0, limit))
+      .map((operation) => clonePendingOperation(operation));
+  }
+
+  async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
+    this.pendingOperations = this.pendingOperations.filter(
+      (operation) => operation.sequence > sequenceInclusive,
+    );
+  }
+
+  async getRawRow(collectionId: string, id: string): Promise<IndexedDbRowRecord<S> | undefined> {
+    return this.db.rows.get([this.namespace, collectionId, id]);
   }
 
   close(): void {
@@ -197,8 +277,8 @@ export class IndexedDbRowStoreAdapter<Value = unknown> implements RowStoreAdapte
   }
 }
 
-export function createIndexedDbRowStoreAdapter<Value = unknown>(
-  input: CreateIndexedDbRowStoreAdapterInput,
-): IndexedDbRowStoreAdapter<Value> {
-  return new IndexedDbRowStoreAdapter<Value>(input);
+export function createIndexedDbRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+>(input: CreateIndexedDbRowStoreAdapterInput): IndexedDbRowStoreAdapter<S> {
+  return new IndexedDbRowStoreAdapter<S>(input);
 }

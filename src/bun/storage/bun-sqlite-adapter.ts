@@ -1,19 +1,8 @@
 import { Database } from "bun:sqlite";
 
-import type {
-  SqliteRowRecord,
-  SqliteStatementExecutor,
-  SqliteTransactionExecutor,
-} from "../../sqlite";
+import type { CollectionValueMap } from "../../core/types";
+import type { SqliteStatementExecutor, SqliteTransactionExecutor } from "../../sqlite";
 import { SqliteRowStoreAdapter } from "../../sqlite";
-
-function assertSqlIdentifier(value: string): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
-    throw new Error(`Invalid SQL identifier: ${value}`);
-  }
-
-  return value;
-}
 
 class BunSqliteStatementExecutor implements SqliteStatementExecutor {
   constructor(private readonly database: Database) {}
@@ -48,14 +37,14 @@ class BunSqliteTransactionExecutor implements SqliteTransactionExecutor {
   async transaction<Result>(
     runner: (executor: SqliteStatementExecutor) => Promise<Result>,
   ): Promise<Result> {
-    this.database.exec("BEGIN IMMEDIATE");
+    this.database.run("BEGIN IMMEDIATE");
     try {
       const result = await runner(new BunSqliteStatementExecutor(this.database));
-      this.database.exec("COMMIT");
+      this.database.run("COMMIT");
       return result;
     } catch (error) {
       try {
-        this.database.exec("ROLLBACK");
+        this.database.run("ROLLBACK");
       } catch {
         // Ignore rollback errors; surface the original failure.
       }
@@ -72,11 +61,10 @@ export interface CreateBunSqliteRowStoreAdapterInput {
   rowsTable?: string;
 }
 
-export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAdapter<Value> {
+export class BunSqliteRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+> extends SqliteRowStoreAdapter<S> {
   readonly database: Database;
-  private readonly userID: string;
-  private readonly namespace: string;
-  private readonly rowsTable: string;
 
   constructor(input: CreateBunSqliteRowStoreAdapterInput) {
     const database = input.database ?? new Database(input.path ?? ":memory:");
@@ -90,32 +78,6 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
     });
 
     this.database = database;
-    this.userID = input.userID;
-    this.namespace = input.namespace;
-    this.rowsTable = assertSqlIdentifier(input.rowsTable ?? "rows");
-  }
-
-  async getRawRow(collection: string, id: string): Promise<SqliteRowRecord | undefined> {
-    const row = this.database
-      .query(
-        `SELECT
-          user_id,
-          namespace,
-          collection,
-          id,
-          parent_id,
-          value_json,
-          hlc,
-          hlc_wall_ms,
-          hlc_counter,
-          hlc_node_id,
-          tx_id,
-          tombstone
-         FROM ${this.rowsTable}
-         WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
-      )
-      .get(this.userID, this.namespace, collection, id);
-    return (row ?? undefined) as SqliteRowRecord | undefined;
   }
 
   close(): void {
@@ -123,8 +85,8 @@ export class BunSqliteRowStoreAdapter<Value = unknown> extends SqliteRowStoreAda
   }
 }
 
-export function createBunSqliteRowStoreAdapter<Value = unknown>(
-  input: CreateBunSqliteRowStoreAdapterInput,
-): BunSqliteRowStoreAdapter<Value> {
-  return new BunSqliteRowStoreAdapter<Value>(input);
+export function createBunSqliteRowStoreAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+>(input: CreateBunSqliteRowStoreAdapterInput): BunSqliteRowStoreAdapter<S> {
+  return new BunSqliteRowStoreAdapter<S>(input);
 }

@@ -48,7 +48,7 @@ describe("localStorage clock adapter", () => {
     const adapter = createLocalStorageClockAdapter({ storage, key: "hlc" });
 
     await adapter.write(asClock("100-2-nodeA"));
-    expect(await adapter.read()).toBe("100-2-nodeA");
+    expect(await adapter.read()).toBe(asClock("100-2-nodeA"));
   });
 
   test("read rejects invalid stored values", async () => {
@@ -69,8 +69,8 @@ describe("localStorage clock adapter", () => {
       now: () => 100,
     });
 
-    expect(await firstService.next()).toBe("100-0-local");
-    expect(await firstService.next()).toBe("100-1-local");
+    expect(await firstService.next()).toBe(asClock("100-0-local"));
+    expect(await firstService.next()).toBe(asClock("100-1-local"));
 
     const secondService = createClockService({
       nodeId: "local",
@@ -78,7 +78,7 @@ describe("localStorage clock adapter", () => {
       now: () => 120,
     });
 
-    expect(await secondService.next()).toBe("120-0-local");
+    expect(await secondService.next()).toBe(asClock("120-0-local"));
     expect(storage.getItem("hlc")).toBe("120-0-local");
   });
 });

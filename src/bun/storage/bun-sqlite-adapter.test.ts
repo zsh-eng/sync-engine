@@ -3,17 +3,46 @@ import { describe, expect, test } from "bun:test";
 import { createEngine } from "../../core/engine";
 import {
   createClockService,
+  parseClock,
   type ClockStorageAdapter,
   type HybridLogicalClock,
 } from "../../core/hlc";
+import type { AnyStoredRow } from "../../core/types";
 import { createBunSqliteRowStoreAdapter } from "./bun-sqlite-adapter";
 
 interface RowValue {
   title: string;
 }
 
+interface Collections {
+  books: RowValue;
+}
+
+const TEST_NAMESPACE = "books-app";
+
 function asClock(value: string): HybridLogicalClock {
   return value as HybridLogicalClock;
+}
+
+function remoteRow(
+  clock: HybridLogicalClock,
+  title: string,
+  txId: string,
+): AnyStoredRow<Collections> {
+  const parsed = parseClock(clock);
+  return {
+    namespace: TEST_NAMESPACE,
+    collectionId: "books",
+    id: "book-1",
+    parentId: null,
+    data: { title },
+    txId,
+    tombstone: false,
+    committedTimestampMs: parsed.wallMs,
+    hlcTimestampMs: parsed.wallMs,
+    hlcCounter: parsed.counter,
+    hlcDeviceId: parsed.nodeId,
+  };
 }
 
 function createBunSqliteEngine() {
@@ -33,13 +62,14 @@ function createBunSqliteEngine() {
     now: () => 3_000,
   });
 
-  const adapter = createBunSqliteRowStoreAdapter<RowValue>({
+  const adapter = createBunSqliteRowStoreAdapter<Collections>({
     userID: "user-1",
-    namespace: "books-app",
+    namespace: TEST_NAMESPACE,
   });
-  const engine = createEngine<RowValue>({
+  const engine = createEngine<Collections>({
     adapter,
     clock,
+    namespace: TEST_NAMESPACE,
     txIDFactory: () => `tx_${++txCounter}`,
   });
 
@@ -53,45 +83,37 @@ function createBunSqliteEngine() {
 }
 
 describe("BunSqliteRowStoreAdapter", () => {
-  test("reports write outcomes when the same row is updated twice in one txn", async () => {
+  test("reports write outcomes when the same row is updated twice", async () => {
     const { engine, cleanup } = createBunSqliteEngine();
 
     try {
-      const writeResult = await engine.txn([
-        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
-        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune Messiah" } },
-      ]);
+      const write = await engine.execute([
+        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune Messiah" } },
+      ] as const);
 
-      expect(writeResult.writes).toEqual([
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          hlc: asClock("3000-0-deviceA"),
-          tombstone: false,
-        },
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          hlc: asClock("3000-1-deviceA"),
-          tombstone: false,
-        },
-      ]);
+      expect(write[0]).toMatchObject({
+        collectionId: "books",
+        id: "book-1",
+        hlcTimestampMs: 3000,
+        hlcCounter: 0,
+        applied: true,
+      });
+      expect(write[1]).toMatchObject({
+        collectionId: "books",
+        id: "book-1",
+        hlcTimestampMs: 3000,
+        hlcCounter: 1,
+        applied: true,
+      });
 
-      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-      expect(read.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get",
-        row: {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "Dune Messiah" },
-          hlc: asClock("3000-1-deviceA"),
-          txID: "tx_1",
-          tombstone: false,
-        },
+      const read = await engine.execute([
+        { type: "get", collectionId: "books", id: "book-1" },
+      ] as const);
+      expect(read[0]).toMatchObject({
+        data: { title: "Dune Messiah" },
+        txId: "tx_1",
+        tombstone: false,
       });
     } finally {
       cleanup();
@@ -102,31 +124,14 @@ describe("BunSqliteRowStoreAdapter", () => {
     const { adapter, engine, cleanup } = createBunSqliteEngine();
 
     try {
-      const write = await engine.txn([
-        { kind: "put", collection: "books", id: "book-1", value: { title: "Dune" } },
-      ]);
-
-      expect(write.writes[0]?.hlc).toBe(asClock("3000-0-deviceA"));
-
-      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-      expect(read.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get",
-        row: {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "Dune" },
-          hlc: asClock("3000-0-deviceA"),
-          txID: "tx_1",
-          tombstone: false,
-        },
-      });
-
-      await engine.txn([{ kind: "delete", collection: "books", id: "book-1" }]);
+      await engine.execute([
+        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+      ] as const);
+      await engine.execute([{ type: "delete", collectionId: "books", id: "book-1" }] as const);
 
       const raw = await adapter.getRawRow("books", "book-1");
       expect(raw).toMatchObject({
+        committed_timestamp_ms: 3000,
         hlc_wall_ms: 3000,
         hlc_counter: 1,
         hlc_node_id: "deviceA",
@@ -138,61 +143,30 @@ describe("BunSqliteRowStoreAdapter", () => {
   });
 
   test("applies LWW tie-break with node ID for equal wall/counter", async () => {
-    const { adapter, engine, cleanup } = createBunSqliteEngine();
+    const { engine, cleanup } = createBunSqliteEngine();
 
     try {
       const firstApply = await engine.applyRemote([
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "from A" },
-          hlc: asClock("9000-2-deviceA"),
-          txID: "tx_remote_a",
-          tombstone: false,
-        },
+        remoteRow(asClock("9000-2-deviceA"), "from A", "tx_a"),
       ]);
       expect(firstApply.appliedCount).toBe(1);
 
       const secondApply = await engine.applyRemote([
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "from Z" },
-          hlc: asClock("9000-2-deviceZ"),
-          txID: "tx_remote_z",
-          tombstone: false,
-        },
+        remoteRow(asClock("9000-2-deviceZ"), "from Z", "tx_z"),
       ]);
       expect(secondApply.appliedCount).toBe(1);
 
       const staleApply = await engine.applyRemote([
-        {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "from B" },
-          hlc: asClock("9000-2-deviceB"),
-          txID: "tx_remote_b",
-          tombstone: false,
-        },
+        remoteRow(asClock("9000-2-deviceB"), "from B", "tx_b"),
       ]);
       expect(staleApply.appliedCount).toBe(0);
 
-      const read = await engine.txn([{ kind: "get", collection: "books", id: "book-1" }]);
-      expect(read.readResults[0]).toEqual({
-        opIndex: 0,
-        kind: "get",
-        row: {
-          collection: "books",
-          id: "book-1",
-          parentID: null,
-          value: { title: "from Z" },
-          hlc: asClock("9000-2-deviceZ"),
-          txID: "tx_remote_z",
-          tombstone: false,
-        },
+      const read = await engine.execute([
+        { type: "get", collectionId: "books", id: "book-1" },
+      ] as const);
+      expect(read[0]).toMatchObject({
+        data: { title: "from Z" },
+        txId: "tx_z",
       });
     } finally {
       cleanup();

@@ -1,106 +1,198 @@
-import { compareClocks } from "../hlc";
-import type { RowStoreAdapter, RowStoreAdapterTransaction, StoredRow, WriteOutcome } from "./types";
+import type {
+  AnyStoredRow,
+  CollectionId,
+  CollectionValueMap,
+  PendingOperation,
+  PendingSequence,
+  RowApplyOutcome,
+  RowId,
+  RowStorageAdapter,
+  StoredRow,
+} from "../types";
 
-function rowKey(collection: string, id: string): string {
-  return `${collection}::${id}`;
+function rowKey(collectionId: string, id: RowId): string {
+  return `${collectionId}::${id}`;
 }
 
-function cloneRow<Value>(row: StoredRow<Value>): StoredRow<Value> {
+function compareHlc(
+  a: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
+  b: Pick<AnyStoredRow<CollectionValueMap>, "hlcTimestampMs" | "hlcCounter" | "hlcDeviceId">,
+): -1 | 0 | 1 {
+  if (a.hlcTimestampMs !== b.hlcTimestampMs) {
+    return a.hlcTimestampMs < b.hlcTimestampMs ? -1 : 1;
+  }
+
+  if (a.hlcCounter !== b.hlcCounter) {
+    return a.hlcCounter < b.hlcCounter ? -1 : 1;
+  }
+
+  if (a.hlcDeviceId === b.hlcDeviceId) {
+    return 0;
+  }
+
+  return a.hlcDeviceId < b.hlcDeviceId ? -1 : 1;
+}
+
+function cloneRow<S extends CollectionValueMap>(row: AnyStoredRow<S>): AnyStoredRow<S> {
   return {
     ...row,
-    value: row.value === null ? null : structuredClone(row.value),
+    data: row.data === null ? null : structuredClone(row.data),
   };
 }
 
-function cloneRowsMap<Value>(
-  rows: ReadonlyMap<string, StoredRow<Value>>,
-): Map<string, StoredRow<Value>> {
-  const next = new Map<string, StoredRow<Value>>();
+function cloneRowsMap<S extends CollectionValueMap>(
+  rows: ReadonlyMap<string, AnyStoredRow<S>>,
+): Map<string, AnyStoredRow<S>> {
+  const next = new Map<string, AnyStoredRow<S>>();
   for (const [key, row] of rows.entries()) {
     next.set(key, cloneRow(row));
   }
   return next;
 }
 
-interface CreateInMemoryRowStoreAdapterInput<Value = unknown> {
-  seedRows?: ReadonlyArray<StoredRow<Value>>;
+function clonePendingOperation<S extends CollectionValueMap>(
+  operation: PendingOperation<S>,
+): PendingOperation<S> {
+  if (operation.type === "put") {
+    return {
+      ...operation,
+      data: structuredClone(operation.data),
+    };
+  }
+
+  return { ...operation };
 }
 
-export class InMemoryRowStoreAdapter<Value = unknown> implements RowStoreAdapter<Value> {
-  private rows = new Map<string, StoredRow<Value>>();
+export interface CreateInMemoryRowStorageAdapterInput<S extends CollectionValueMap> {
+  namespace?: string;
+  seedRows?: ReadonlyArray<AnyStoredRow<S>>;
+}
 
-  constructor(input: CreateInMemoryRowStoreAdapterInput<Value> = {}) {
+export class InMemoryRowStorageAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+> implements RowStorageAdapter<S> {
+  private readonly namespace: string;
+  private rows = new Map<string, AnyStoredRow<S>>();
+  private pendingOperations: PendingOperation<S>[] = [];
+
+  constructor(input: CreateInMemoryRowStorageAdapterInput<S> = {}) {
+    this.namespace = input.namespace ?? "default";
+
     if (!input.seedRows) {
       return;
     }
 
     for (const row of input.seedRows) {
-      this.rows.set(rowKey(row.collection, row.id), cloneRow(row));
+      if (row.namespace !== this.namespace) {
+        continue;
+      }
+
+      this.rows.set(rowKey(row.collectionId, row.id), cloneRow(row));
     }
   }
 
-  async txn<Result>(
-    runner: (tx: RowStoreAdapterTransaction<Value>) => Promise<Result>,
-  ): Promise<Result> {
-    const workingRows = cloneRowsMap(this.rows);
-
-    const tx: RowStoreAdapterTransaction<Value> = {
-      getAll: async (collection) => {
-        const rows: StoredRow<Value>[] = [];
-        for (const row of workingRows.values()) {
-          if (row.collection === collection) {
-            rows.push(cloneRow(row));
-          }
-        }
-        return rows;
-      },
-      get: async (collection, id) => {
-        const row = workingRows.get(rowKey(collection, id));
-        return row ? cloneRow(row) : undefined;
-      },
-      getAllWithParent: async (collection, parentID) => {
-        const rows: StoredRow<Value>[] = [];
-        for (const row of workingRows.values()) {
-          if (row.collection === collection && row.parentID === parentID) {
-            rows.push(cloneRow(row));
-          }
-        }
-        return rows;
-      },
-      applyRows: async (rows) => {
-        const outcomes: WriteOutcome[] = [];
-        for (const row of rows) {
-          const key = rowKey(row.collection, row.id);
-          const existing = workingRows.get(key);
-          const written = !existing || compareClocks(row.hlc, existing.hlc) === 1;
-          if (written) {
-            workingRows.set(key, cloneRow(row));
-          }
-          outcomes.push({
-            written,
-            collection: row.collection,
-            id: row.id,
-            parentID: row.parentID,
-            hlc: row.hlc,
-            tombstone: row.tombstone,
-          });
-        }
-        return outcomes;
-      },
-    };
-
-    const result = await runner(tx);
-    this.rows = workingRows;
-    return result;
+  async get<C extends CollectionId<S>>(
+    collectionId: C,
+    id: RowId,
+  ): Promise<StoredRow<S, C> | undefined> {
+    const row = this.rows.get(rowKey(collectionId, id));
+    return row ? (cloneRow(row) as StoredRow<S, C>) : undefined;
   }
 
-  async dumpAll(): Promise<StoredRow<Value>[]> {
+  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
+    const rows: StoredRow<S, C>[] = [];
+
+    for (const row of this.rows.values()) {
+      if (row.collectionId === collectionId) {
+        rows.push(cloneRow(row) as StoredRow<S, C>);
+      }
+    }
+
+    return rows;
+  }
+
+  async getAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StoredRow<S, C>>> {
+    const rows: StoredRow<S, C>[] = [];
+
+    for (const row of this.rows.values()) {
+      if (row.collectionId === collectionId && row.parentId === parentId) {
+        rows.push(cloneRow(row) as StoredRow<S, C>);
+      }
+    }
+
+    return rows;
+  }
+
+  async applyRows(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<Array<RowApplyOutcome<S>>> {
+    const workingRows = cloneRowsMap(this.rows);
+    const outcomes: RowApplyOutcome<S>[] = [];
+
+    for (const row of rows) {
+      if (row.namespace !== this.namespace) {
+        throw new Error(
+          `Namespace mismatch: adapter namespace is "${this.namespace}" but received "${row.namespace}"`,
+        );
+      }
+
+      const key = rowKey(row.collectionId, row.id);
+      const existing = workingRows.get(key);
+      const written = !existing || compareHlc(row, existing) === 1;
+
+      if (written) {
+        workingRows.set(key, cloneRow(row));
+      }
+
+      outcomes.push({
+        written,
+        collectionId: row.collectionId,
+        id: row.id,
+        parentId: row.parentId,
+        tombstone: row.tombstone,
+        committedTimestampMs: row.committedTimestampMs,
+        hlcTimestampMs: row.hlcTimestampMs,
+        hlcCounter: row.hlcCounter,
+        hlcDeviceId: row.hlcDeviceId,
+      });
+    }
+
+    this.rows = workingRows;
+    return outcomes;
+  }
+
+  async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
+    if (operations.length === 0) {
+      return;
+    }
+
+    for (const operation of operations) {
+      this.pendingOperations.push(clonePendingOperation(operation));
+    }
+
+    this.pendingOperations.sort((a, b) => a.sequence - b.sequence);
+  }
+
+  async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
+    return this.pendingOperations
+      .slice(0, Math.max(0, limit))
+      .map((operation) => clonePendingOperation(operation));
+  }
+
+  async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
+    this.pendingOperations = this.pendingOperations.filter(
+      (operation) => operation.sequence > sequenceInclusive,
+    );
+  }
+
+  async dumpAll(): Promise<Array<AnyStoredRow<S>>> {
     return [...this.rows.values()].map((row) => cloneRow(row));
   }
 }
 
-export function createInMemoryRowStoreAdapter<Value = unknown>(
-  input: CreateInMemoryRowStoreAdapterInput<Value> = {},
-): InMemoryRowStoreAdapter<Value> {
-  return new InMemoryRowStoreAdapter<Value>(input);
+export function createInMemoryRowStorageAdapter<
+  S extends CollectionValueMap = Record<string, unknown>,
+>(input: CreateInMemoryRowStorageAdapterInput<S> = {}): InMemoryRowStorageAdapter<S> {
+  return new InMemoryRowStorageAdapter<S>(input);
 }
