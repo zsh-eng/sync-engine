@@ -1,4 +1,4 @@
-export type CollectionValueMap = Record<string, unknown>;
+export type CollectionValueMap = object;
 
 export type CollectionId<S extends CollectionValueMap> = Extract<keyof S, string>;
 export type Namespace = string;
@@ -192,7 +192,9 @@ export interface Storage<
   S extends CollectionValueMap,
   KV extends Record<string, unknown> = Record<string, unknown>,
 > {
-  execute<const Ops extends readonly StorageOp<S>[]>(operations: Ops): Promise<StorageResults<S, Ops>>;
+  execute<const Ops extends readonly StorageOp<S>[]>(
+    operations: Ops,
+  ): Promise<StorageResults<S, Ops>>;
   getPending(limit: number): Promise<Array<PendingOperation<S>>>;
   removePendingThrough(sequenceInclusive: PendingSequence): Promise<void>;
   putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void>;
