@@ -128,6 +128,14 @@ This avoids ambiguity when many mutations target the same row.
 HLC provides deterministic LWW conflict ordering across devices.
 Tie-break is `hlcDeviceId`.
 
+`hlcDeviceId` requirements for v1:
+
+- Character set: ASCII `[A-Za-z0-9_-]`
+- Length: 6 to 32 characters
+- Default generation: `nanoid(6)` (compact and sufficient for expected per-user device counts)
+- Semantics: opaque, stable identifier unique per device within a user partition
+- Human-readable device names should be stored separately and mapped to `hlcDeviceId` in app/server metadata.
+
 ### 3.6 Commit Timestamp And Cursor
 
 Server commits are ordered by `(committedTimestampMs, collectionId, id)`.
