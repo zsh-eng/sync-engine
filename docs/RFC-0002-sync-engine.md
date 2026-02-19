@@ -42,27 +42,64 @@ Canonical identity key for row state: `(userId?, namespace, collectionId, id)`.
 
 ### 3.2 Storage
 
-`Storage` exposes a single batched `execute()` API for typed operations:
+`Storage` exposes ergonomic methods for app code (no operation-object API required):
 
-- `get`
-- `getAll`
-- `getAllWithParent`
-- `put`
-- `delete`
-- `deleteAllWithParent`
+Read methods:
 
-And a KV API for metadata:
+- `get(collectionId, id)`
+- `getAll(collectionId)`
+- `getAllWithParent(collectionId, parentId)`
+
+Write methods:
+
+- `put(collectionId, id, data, parentId?)`
+- `delete(collectionId, id)`
+- `deleteAllWithParent(collectionId, parentId)`
+- `batchLocal(operations)` where operations are only atomic CUD operations (`put` and `delete`)
+
+Remote apply:
+
+- `applyRemote(rows)` for already-HLC-stamped rows from the server
+
+KV API for metadata:
 
 - `putKV`
 - `getKV`
 - `deleteKV`
 
-The KV API persists sync metadata such as pull cursor and retry state.
+Pending API:
+
+- `getPending`
+- `removePendingThrough`
+
+Semantics:
+
+- Any mutating method (`put`, `delete`, `deleteAllWithParent`, `batchLocal`) runs as a local-atomic write pipeline:
+  1. Resolve concrete target rows (if needed)
+  2. Allocate HLC batch
+  3. Build canonical row envelopes (tombstones for deletes)
+  4. Apply through adapter conflict resolution
+  5. Append successful local changes to pending log
+  6. Emit invalidation hints
+- Read methods are side-effect free and do not allocate HLC values.
+- KV persists sync metadata such as pull cursor and retry state.
 
 ### 3.3 Storage Adapter
 
-`Storage` transforms high-level operations to row-level operations and delegates to a `RowStorageAdapter`.
-Adapters push conflict resolution and bulk execution down to the storage backend.
+`Storage` maps method calls to a narrow adapter core.
+Adapters own conflict resolution and bulk execution details.
+
+Recommended adapter primitives:
+
+- `query({ collectionId, id?, parentId?, includeTombstones? })`
+- `applyRows(rows)` (bulk LWW apply)
+- `appendPending(operations)`, `getPending(limit)`, `removePendingThrough(sequenceInclusive)`
+- `putKV`, `getKV`, `deleteKV` (or equivalent durable metadata store)
+
+Notes:
+
+- `get`, `getAll`, `getAllWithParent`, and internal read planning are all specializations of one `query` shape.
+- `deleteAllWithParent` is implemented in `Storage` by querying matching live rows, stamping tombstones with fresh HLC, and sending atomic row deletes through `batchLocal`/`applyRows` (optionally chunked).
 
 Examples:
 
@@ -82,6 +119,7 @@ Local writes are appended to a pending operation log with a strictly increasing 
 - Sequence source: auto-increment integer primary key
 - Push order: ascending by sequence
 - Ack/removal semantics: remove through sequence `N` (`<= N`)
+- Row apply and pending append should be committed in one local transaction when backend capabilities allow.
 
 This avoids ambiguity when many mutations target the same row.
 
@@ -139,7 +177,7 @@ Auth configuration belongs to transport construction (cookie or bearer token mod
 3. On ack, `removePendingThrough(ackSequence)`.
 4. Read cursor from KV.
 5. `pull` with cursor and limit.
-6. Apply pulled changes through storage (LWW).
+6. Apply pulled changes through `applyRemote` (adapter LWW).
 7. Persist `nextCursor`.
 8. Repeat while `hasMore`.
 
@@ -149,8 +187,9 @@ TypeScript generics should be driven by app collection schemas.
 Expected shape:
 
 - `Collections` map keyed by `collectionId`
-- operation input type constrained by collection key
-- operation result inferred from operation kind and collection key
+- method input type constrained by collection key
+- method result inferred from collection key and method type
+- `batchLocal` operation union is limited to `put` and `delete`
 - support for Zod-based apps by passing inferred collection value types
 
 This keeps API calls strongly typed while preserving a small runtime surface.
@@ -172,3 +211,4 @@ This RFC optimizes for simple personal-data sync and not high-concurrency collab
 1. Should `schemaVersion` be required or optional in v1 row envelopes?
 2. Should server pulls exclude rows authored by the requesting `hlcDeviceId`, or always return full ordered state?
 3. Which index baseline should be mandatory for every server adapter beyond `(userId, namespace, committedTimestampMs, collectionId, id)`?
+4. For collections with a required parent relationship, should `parentId` become mandatory on `put` to avoid read-before-write parent lookups?
