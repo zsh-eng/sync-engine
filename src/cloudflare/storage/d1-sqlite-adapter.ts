@@ -90,6 +90,7 @@ export interface CreateD1SqliteRowStoreAdapterInput {
   userID: string;
   namespace: string;
   rowsTable?: string;
+  kvTable?: string;
 }
 
 export class D1SqliteRowStoreAdapter<
@@ -105,6 +106,7 @@ export class D1SqliteRowStoreAdapter<
       userID: input.userID,
       namespace: input.namespace,
       rowsTable: input.rowsTable,
+      kvTable: input.kvTable,
     });
 
     this.database = input.database;

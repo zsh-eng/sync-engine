@@ -1,5 +1,11 @@
 import Dexie, { type Table } from "dexie";
 
+import {
+  appendPendingOperations,
+  compareHlc,
+  getPendingOperations,
+  removePendingOperationsThrough,
+} from "../../core/storage/shared";
 import type {
   AnyStoredRow,
   CollectionId,
@@ -7,16 +13,10 @@ import type {
   PendingOperation,
   PendingSequence,
   RowApplyOutcome,
-  RowId,
+  RowQuery,
   RowStorageAdapter,
   StoredRow,
 } from "../../core/types";
-import {
-  appendPendingOperations,
-  compareHlc,
-  getPendingOperations,
-  removePendingOperationsThrough,
-} from "../../core/storage/shared";
 
 export interface IndexedDbRowRecord<S extends CollectionValueMap = Record<string, unknown>> {
   namespace: string;
@@ -32,8 +32,15 @@ export interface IndexedDbRowRecord<S extends CollectionValueMap = Record<string
   tombstone: 0 | 1;
 }
 
+export interface IndexedDbKVRecord {
+  namespace: string;
+  key: string;
+  value: unknown;
+}
+
 class RowStoreDexieDatabase<S extends CollectionValueMap = Record<string, unknown>> extends Dexie {
   readonly rows!: Table<IndexedDbRowRecord<S>, [string, string, string]>;
+  readonly kv!: Table<IndexedDbKVRecord, [string, string]>;
 
   constructor(
     name: string,
@@ -46,6 +53,7 @@ class RowStoreDexieDatabase<S extends CollectionValueMap = Record<string, unknow
 
     this.version(1).stores({
       rows: "&[namespace+collectionId+id], [namespace+collectionId], [namespace+collectionId+parentId], [namespace+collectionId+tombstone], [namespace+committedTimestampMs+collectionId+id], [namespace+hlcTimestampMs+hlcCounter+hlcDeviceId]",
+      kv: "&[namespace+key]",
     });
   }
 }
@@ -120,30 +128,33 @@ export class IndexedDbRowStoreAdapter<
     this.db = new RowStoreDexieDatabase<S>(input.dbName, options);
   }
 
-  async get<C extends CollectionId<S>>(
-    collectionId: C,
-    id: RowId,
-  ): Promise<StoredRow<S, C> | undefined> {
-    const row = await this.db.rows.get([this.namespace, collectionId, id]);
-    return row ? (toStoredRow<S>(row) as StoredRow<S, C>) : undefined;
-  }
+  async query<C extends CollectionId<S>>(query: RowQuery<S, C>): Promise<Array<StoredRow<S, C>>> {
+    const includeTombstones = query.includeTombstones === true;
+    let rows: IndexedDbRowRecord<S>[];
 
-  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
-    const rows = await this.db.rows
-      .where("[namespace+collectionId]")
-      .equals([this.namespace, collectionId])
-      .toArray();
-    return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
-  }
+    if (query.id !== undefined) {
+      const row = await this.db.rows.get([this.namespace, query.collectionId, query.id]);
+      rows = row ? [row] : [];
+    } else if (query.parentId !== undefined) {
+      rows = await this.db.rows
+        .where("[namespace+collectionId+parentId]")
+        .equals([this.namespace, query.collectionId, query.parentId])
+        .toArray();
+    } else {
+      rows = await this.db.rows
+        .where("[namespace+collectionId]")
+        .equals([this.namespace, query.collectionId])
+        .toArray();
+    }
 
-  async getAllWithParent<C extends CollectionId<S>>(
-    collectionId: C,
-    parentId: RowId,
-  ): Promise<Array<StoredRow<S, C>>> {
-    const rows = await this.db.rows
-      .where("[namespace+collectionId+parentId]")
-      .equals([this.namespace, collectionId, parentId])
-      .toArray();
+    if (query.parentId !== undefined) {
+      rows = rows.filter((row) => row.parentId === query.parentId);
+    }
+
+    if (!includeTombstones) {
+      rows = rows.filter((row) => row.tombstone === 0);
+    }
+
     return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
   }
 
@@ -227,6 +238,23 @@ export class IndexedDbRowStoreAdapter<
       this.pendingOperations,
       sequenceInclusive,
     );
+  }
+
+  async putKV(key: string, value: unknown): Promise<void> {
+    await this.db.kv.put({
+      namespace: this.namespace,
+      key,
+      value: structuredClone(value),
+    });
+  }
+
+  async getKV<Value = unknown>(key: string): Promise<Value | undefined> {
+    const record = await this.db.kv.get([this.namespace, key]);
+    return record ? (structuredClone(record.value) as Value) : undefined;
+  }
+
+  async deleteKV(key: string): Promise<void> {
+    await this.db.kv.delete([this.namespace, key]);
   }
 
   async getRawRow(collectionId: string, id: string): Promise<IndexedDbRowRecord<S> | undefined> {

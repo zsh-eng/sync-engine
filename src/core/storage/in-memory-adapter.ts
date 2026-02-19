@@ -5,7 +5,7 @@ import type {
   PendingOperation,
   PendingSequence,
   RowApplyOutcome,
-  RowId,
+  RowQuery,
   RowStorageAdapter,
   StoredRow,
 } from "../types";
@@ -45,6 +45,7 @@ export class InMemoryRowStorageAdapter<
   private readonly namespace: string;
   private rows = new Map<string, AnyStoredRow<S>>();
   private pendingOperations: PendingOperation<S>[] = [];
+  private readonly kvStore = new Map<string, unknown>();
 
   constructor(input: CreateInMemoryRowStorageAdapterInput<S> = {}) {
     this.namespace = input.namespace ?? "default";
@@ -62,36 +63,27 @@ export class InMemoryRowStorageAdapter<
     }
   }
 
-  async get<C extends CollectionId<S>>(
-    collectionId: C,
-    id: RowId,
-  ): Promise<StoredRow<S, C> | undefined> {
-    const row = this.rows.get(rowKey(collectionId, id));
-    return row ? (cloneRow(row) as StoredRow<S, C>) : undefined;
-  }
-
-  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
+  async query<C extends CollectionId<S>>(query: RowQuery<S, C>): Promise<Array<StoredRow<S, C>>> {
     const rows: StoredRow<S, C>[] = [];
 
     for (const row of this.rows.values()) {
-      if (row.collectionId === collectionId) {
-        rows.push(cloneRow(row) as StoredRow<S, C>);
+      if (row.collectionId !== query.collectionId) {
+        continue;
       }
-    }
 
-    return rows;
-  }
-
-  async getAllWithParent<C extends CollectionId<S>>(
-    collectionId: C,
-    parentId: RowId,
-  ): Promise<Array<StoredRow<S, C>>> {
-    const rows: StoredRow<S, C>[] = [];
-
-    for (const row of this.rows.values()) {
-      if (row.collectionId === collectionId && row.parentId === parentId) {
-        rows.push(cloneRow(row) as StoredRow<S, C>);
+      if (query.id !== undefined && row.id !== query.id) {
+        continue;
       }
+
+      if (query.parentId !== undefined && row.parentId !== query.parentId) {
+        continue;
+      }
+
+      if (!query.includeTombstones && row.tombstone) {
+        continue;
+      }
+
+      rows.push(cloneRow(row) as StoredRow<S, C>);
     }
 
     return rows;
@@ -146,6 +138,19 @@ export class InMemoryRowStorageAdapter<
       this.pendingOperations,
       sequenceInclusive,
     );
+  }
+
+  async putKV(key: string, value: unknown): Promise<void> {
+    this.kvStore.set(key, structuredClone(value));
+  }
+
+  async getKV<Value = unknown>(key: string): Promise<Value | undefined> {
+    const value = this.kvStore.get(key);
+    return value === undefined ? undefined : (structuredClone(value) as Value);
+  }
+
+  async deleteKV(key: string): Promise<void> {
+    this.kvStore.delete(key);
   }
 
   async dumpAll(): Promise<Array<AnyStoredRow<S>>> {

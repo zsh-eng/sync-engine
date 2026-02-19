@@ -36,33 +36,23 @@ export interface StoredRow<
 
 export type AnyStoredRow<S extends CollectionValueMap> = StoredRow<S, CollectionId<S>>;
 
-export interface StorageOpGet<
+export interface RowQuery<
   S extends CollectionValueMap,
   C extends CollectionId<S> = CollectionId<S>,
 > {
-  type: "get";
   collectionId: C;
-  id: RowId;
+  id?: RowId;
+  parentId?: RowId;
+  includeTombstones?: boolean;
 }
 
-export interface StorageOpGetAll<
-  S extends CollectionValueMap,
-  C extends CollectionId<S> = CollectionId<S>,
-> {
-  type: "getAll";
-  collectionId: C;
+export interface StoragePutOptions {
+  parentId?: RowId | null;
+  txId?: string;
+  schemaVersion?: number;
 }
 
-export interface StorageOpGetAllWithParent<
-  S extends CollectionValueMap,
-  C extends CollectionId<S> = CollectionId<S>,
-> {
-  type: "getAllWithParent";
-  collectionId: C;
-  parentId: RowId;
-}
-
-export interface StorageOpPut<
+export interface StorageAtomicPutOperation<
   S extends CollectionValueMap,
   C extends CollectionId<S> = CollectionId<S>,
 > {
@@ -75,7 +65,7 @@ export interface StorageOpPut<
   schemaVersion?: number;
 }
 
-export interface StorageOpDelete<
+export interface StorageAtomicDeleteOperation<
   S extends CollectionValueMap,
   C extends CollectionId<S> = CollectionId<S>,
 > {
@@ -84,22 +74,9 @@ export interface StorageOpDelete<
   id: RowId;
 }
 
-export interface StorageOpDeleteAllWithParent<
-  S extends CollectionValueMap,
-  C extends CollectionId<S> = CollectionId<S>,
-> {
-  type: "deleteAllWithParent";
-  collectionId: C;
-  parentId: RowId;
-}
-
-export type StorageOp<S extends CollectionValueMap> =
-  | StorageOpGet<S>
-  | StorageOpGetAll<S>
-  | StorageOpGetAllWithParent<S>
-  | StorageOpPut<S>
-  | StorageOpDelete<S>
-  | StorageOpDeleteAllWithParent<S>;
+export type StorageAtomicOperation<S extends CollectionValueMap> =
+  | StorageAtomicPutOperation<S>
+  | StorageAtomicDeleteOperation<S>;
 
 export interface StorageWriteResult<
   S extends CollectionValueMap,
@@ -124,28 +101,7 @@ export interface StorageChangeEvent<S extends CollectionValueMap> {
   invalidationHints: Array<StorageInvalidationHint<S>>;
 }
 
-export type StorageListener<S extends CollectionValueMap> = (
-  event: StorageChangeEvent<S>,
-) => void;
-
-export type StorageResult<S extends CollectionValueMap, Op extends StorageOp<S>> =
-  Op extends StorageOpGet<S, infer C extends CollectionId<S>>
-    ? StoredRow<S, C> | undefined
-    : Op extends StorageOpGetAll<S, infer C extends CollectionId<S>>
-      ? Array<StoredRow<S, C>>
-      : Op extends StorageOpGetAllWithParent<S, infer C extends CollectionId<S>>
-        ? Array<StoredRow<S, C>>
-        : Op extends StorageOpPut<S, infer C extends CollectionId<S>>
-          ? StorageWriteResult<S, C>
-          : Op extends StorageOpDelete<S, infer C extends CollectionId<S>>
-            ? StorageWriteResult<S, C>
-            : Op extends StorageOpDeleteAllWithParent<S, infer C extends CollectionId<S>>
-              ? Array<StorageWriteResult<S, C>>
-              : never;
-
-export type StorageResults<S extends CollectionValueMap, Ops extends readonly StorageOp<S>[]> = {
-  [Index in keyof Ops]: Ops[Index] extends StorageOp<S> ? StorageResult<S, Ops[Index]> : never;
-};
+export type StorageListener<S extends CollectionValueMap> = (event: StorageChangeEvent<S>) => void;
 
 export interface PendingPutOperation<
   S extends CollectionValueMap,
@@ -191,25 +147,46 @@ export interface RowApplyOutcome<
 }
 
 export interface RowStorageAdapter<S extends CollectionValueMap> {
-  get<C extends CollectionId<S>>(collectionId: C, id: RowId): Promise<StoredRow<S, C> | undefined>;
-  getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>>;
-  getAllWithParent<C extends CollectionId<S>>(
-    collectionId: C,
-    parentId: RowId,
-  ): Promise<Array<StoredRow<S, C>>>;
+  query<C extends CollectionId<S>>(query: RowQuery<S, C>): Promise<Array<StoredRow<S, C>>>;
   applyRows(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<Array<RowApplyOutcome<S>>>;
   appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void>;
   getPending(limit: number): Promise<Array<PendingOperation<S>>>;
   removePendingThrough(sequenceInclusive: PendingSequence): Promise<void>;
+  putKV(key: string, value: unknown): Promise<void>;
+  getKV<Value = unknown>(key: string): Promise<Value | undefined>;
+  deleteKV(key: string): Promise<void>;
+}
+
+export interface ApplyRemoteResult<S extends CollectionValueMap> {
+  appliedCount: number;
+  invalidationHints: Array<StorageInvalidationHint<S>>;
 }
 
 export interface Storage<
   S extends CollectionValueMap,
   KV extends Record<string, unknown> = Record<string, unknown>,
 > {
-  execute<const Ops extends readonly StorageOp<S>[]>(
-    operations: Ops,
-  ): Promise<StorageResults<S, Ops>>;
+  get<C extends CollectionId<S>>(collectionId: C, id: RowId): Promise<StoredRow<S, C> | undefined>;
+  getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>>;
+  getAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StoredRow<S, C>>>;
+  put<C extends CollectionId<S>>(
+    collectionId: C,
+    id: RowId,
+    data: S[C],
+    options?: StoragePutOptions,
+  ): Promise<StorageWriteResult<S, C>>;
+  delete<C extends CollectionId<S>>(collectionId: C, id: RowId): Promise<StorageWriteResult<S, C>>;
+  deleteAllWithParent<C extends CollectionId<S>>(
+    collectionId: C,
+    parentId: RowId,
+  ): Promise<Array<StorageWriteResult<S, C>>>;
+  batchLocal(
+    operations: ReadonlyArray<StorageAtomicOperation<S>>,
+  ): Promise<Array<StorageWriteResult<S>>>;
+  applyRemote(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<ApplyRemoteResult<S>>;
   getPending(limit: number): Promise<Array<PendingOperation<S>>>;
   removePendingThrough(sequenceInclusive: PendingSequence): Promise<void>;
   putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void>;

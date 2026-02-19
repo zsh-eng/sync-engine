@@ -87,10 +87,10 @@ describe("BunSqliteRowStoreAdapter", () => {
     const { engine, cleanup } = createBunSqliteEngine();
 
     try {
-      const write = await engine.execute([
+      const write = await engine.batchLocal([
         { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
         { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune Messiah" } },
-      ] as const);
+      ]);
 
       expect(write[0]).toMatchObject({
         collectionId: "books",
@@ -107,10 +107,8 @@ describe("BunSqliteRowStoreAdapter", () => {
         applied: true,
       });
 
-      const read = await engine.execute([
-        { type: "get", collectionId: "books", id: "book-1" },
-      ] as const);
-      expect(read[0]).toMatchObject({
+      const read = await engine.get("books", "book-1");
+      expect(read).toMatchObject({
         data: { title: "Dune Messiah" },
         txId: "tx_1",
         tombstone: false,
@@ -124,10 +122,8 @@ describe("BunSqliteRowStoreAdapter", () => {
     const { adapter, engine, cleanup } = createBunSqliteEngine();
 
     try {
-      await engine.execute([
-        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
-      ] as const);
-      await engine.execute([{ type: "delete", collectionId: "books", id: "book-1" }] as const);
+      await engine.put("books", "book-1", { title: "Dune" });
+      await engine.delete("books", "book-1");
 
       const raw = await adapter.getRawRow("books", "book-1");
       expect(raw).toMatchObject({
@@ -161,10 +157,8 @@ describe("BunSqliteRowStoreAdapter", () => {
       ]);
       expect(staleApply.appliedCount).toBe(0);
 
-      const read = await engine.execute([
-        { type: "get", collectionId: "books", id: "book-1" },
-      ] as const);
-      expect(read[0]).toMatchObject({
+      const read = await engine.get("books", "book-1");
+      expect(read).toMatchObject({
         data: { title: "from Z" },
         txId: "tx_z",
       });

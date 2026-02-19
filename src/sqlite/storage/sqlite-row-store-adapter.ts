@@ -4,8 +4,8 @@ import type {
   CollectionValueMap,
   PendingOperation,
   PendingSequence,
+  RowQuery,
   RowApplyOutcome,
-  RowId,
   RowStorageAdapter,
   StoredRow,
 } from "../../core/types";
@@ -18,6 +18,7 @@ import {
 } from "../../core/storage/shared";
 
 const DEFAULT_ROWS_TABLE = "rows";
+const DEFAULT_KV_TABLE = "sync_kv";
 const ROW_BIND_PARAMETER_COUNT = 12;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 90;
 
@@ -99,6 +100,7 @@ interface CreateSqliteRowStoreAdapterInput {
   userID: string;
   namespace: string;
   rowsTable?: string;
+  kvTable?: string;
   maxRowsPerStatement?: number;
 }
 
@@ -191,8 +193,27 @@ function createRowsSchemaStatements(rowsTable: string): string[] {
   ];
 }
 
-export function createSqliteRowStoreSchemaStatements(rowsTable = DEFAULT_ROWS_TABLE): string[] {
-  return createRowsSchemaStatements(assertSqlIdentifier(rowsTable));
+function createKVSchemaStatements(kvTable: string): string[] {
+  return [
+    `CREATE TABLE IF NOT EXISTS ${kvTable} (
+      user_id TEXT NOT NULL,
+      namespace TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      PRIMARY KEY (user_id, namespace, key)
+    )`,
+  ];
+}
+
+function createSchemaStatements(rowsTable: string, kvTable: string): string[] {
+  return [...createRowsSchemaStatements(rowsTable), ...createKVSchemaStatements(kvTable)];
+}
+
+export function createSqliteRowStoreSchemaStatements(
+  rowsTable = DEFAULT_ROWS_TABLE,
+  kvTable = DEFAULT_KV_TABLE,
+): string[] {
+  return createSchemaStatements(assertSqlIdentifier(rowsTable), assertSqlIdentifier(kvTable));
 }
 
 export class SqliteRowStoreAdapter<
@@ -202,6 +223,7 @@ export class SqliteRowStoreAdapter<
   private readonly userID: string;
   private readonly namespace: string;
   private readonly rowsTable: string;
+  private readonly kvTable: string;
   private readonly selectColumns: string;
   private readonly upsertStatementHead: string;
   private readonly upsertStatementTail: string;
@@ -216,6 +238,7 @@ export class SqliteRowStoreAdapter<
     this.userID = assertUserID(input.userID);
     this.namespace = assertNamespace(input.namespace);
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? DEFAULT_ROWS_TABLE);
+    this.kvTable = assertSqlIdentifier(input.kvTable ?? DEFAULT_KV_TABLE);
     this.maxRowsPerStatement = this.resolveMaxRowsPerStatement(input.maxRowsPerStatement);
     this.selectColumns = [
       "user_id",
@@ -268,45 +291,30 @@ export class SqliteRowStoreAdapter<
     RETURNING collection, id, parent_id, committed_timestamp_ms, hlc_wall_ms, hlc_counter, hlc_node_id, tombstone`;
   }
 
-  async get<C extends CollectionId<S>>(
-    collectionId: C,
-    id: RowId,
-  ): Promise<StoredRow<S, C> | undefined> {
+  async query<C extends CollectionId<S>>(query: RowQuery<S, C>): Promise<Array<StoredRow<S, C>>> {
     return this.queue.run(async () => {
       await this.ensureSchema();
       return this.executor.transaction(async (sql) => {
-        const row = await sql.get<SqliteRowRecord>(
-          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND id = ?`,
-          [this.userID, this.namespace, collectionId, id],
-        );
-        return row ? (toStoredRow<S>(row) as StoredRow<S, C>) : undefined;
-      });
-    });
-  }
+        const whereClauses = ["user_id = ?", "namespace = ?", "collection = ?"];
+        const params: unknown[] = [this.userID, this.namespace, query.collectionId];
 
-  async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
-    return this.queue.run(async () => {
-      await this.ensureSchema();
-      return this.executor.transaction(async (sql) => {
-        const rows = await sql.all<SqliteRowRecord>(
-          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ?`,
-          [this.userID, this.namespace, collectionId],
-        );
-        return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
-      });
-    });
-  }
+        if (query.id !== undefined) {
+          whereClauses.push("id = ?");
+          params.push(query.id);
+        }
 
-  async getAllWithParent<C extends CollectionId<S>>(
-    collectionId: C,
-    parentId: RowId,
-  ): Promise<Array<StoredRow<S, C>>> {
-    return this.queue.run(async () => {
-      await this.ensureSchema();
-      return this.executor.transaction(async (sql) => {
+        if (query.parentId !== undefined) {
+          whereClauses.push("parent_id = ?");
+          params.push(query.parentId);
+        }
+
+        if (query.includeTombstones !== true) {
+          whereClauses.push("tombstone = 0");
+        }
+
         const rows = await sql.all<SqliteRowRecord>(
-          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE user_id = ? AND namespace = ? AND collection = ? AND parent_id = ?`,
-          [this.userID, this.namespace, collectionId, parentId],
+          `SELECT ${this.selectColumns} FROM ${this.rowsTable} WHERE ${whereClauses.join(" AND ")}`,
+          params,
         );
         return rows.map((row) => toStoredRow<S>(row) as StoredRow<S, C>);
       });
@@ -357,6 +365,46 @@ export class SqliteRowStoreAdapter<
     });
   }
 
+  async putKV(key: string, value: unknown): Promise<void> {
+    await this.queue.run(async () => {
+      await this.ensureSchema();
+      await this.executor.transaction(async (sql) => {
+        await sql.run(
+          `INSERT INTO ${this.kvTable} (user_id, namespace, key, value_json)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(user_id, namespace, key) DO UPDATE SET
+            value_json = excluded.value_json`,
+          [this.userID, this.namespace, key, toValueJson(value)],
+        );
+      });
+    });
+  }
+
+  async getKV<Value = unknown>(key: string): Promise<Value | undefined> {
+    return this.queue.run(async () => {
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        const record = await sql.get<{ value_json: string }>(
+          `SELECT value_json FROM ${this.kvTable} WHERE user_id = ? AND namespace = ? AND key = ?`,
+          [this.userID, this.namespace, key],
+        );
+        return record ? parseValueJson<Value>(record.value_json) : undefined;
+      });
+    });
+  }
+
+  async deleteKV(key: string): Promise<void> {
+    await this.queue.run(async () => {
+      await this.ensureSchema();
+      await this.executor.transaction(async (sql) => {
+        await sql.run(
+          `DELETE FROM ${this.kvTable} WHERE user_id = ? AND namespace = ? AND key = ?`,
+          [this.userID, this.namespace, key],
+        );
+      });
+    });
+  }
+
   async getRawRow(collectionId: string, id: string): Promise<SqliteRowRecord | undefined> {
     return this.queue.run(async () => {
       await this.ensureSchema();
@@ -372,7 +420,7 @@ export class SqliteRowStoreAdapter<
   private async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
       this.schemaReady = this.executor.transaction(async (sql) => {
-        const schemaStatements = createRowsSchemaStatements(this.rowsTable);
+        const schemaStatements = createSchemaStatements(this.rowsTable, this.kvTable);
         for (const statement of schemaStatements) {
           await sql.run(statement);
         }

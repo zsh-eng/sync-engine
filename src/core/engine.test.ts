@@ -84,16 +84,9 @@ describe("Engine core behavior", () => {
   test("executes put/get/getAll operations", async () => {
     const { engine } = createTestEngine();
 
-    const write = await engine.execute([
-      {
-        type: "put",
-        collectionId: "books",
-        id: "book-1",
-        data: { title: "Dune" },
-      },
-    ] as const);
+    const write = await engine.put("books", "book-1", { title: "Dune" });
 
-    expect(write[0]).toEqual({
+    expect(write).toEqual({
       collectionId: "books",
       id: "book-1",
       parentId: null,
@@ -105,12 +98,10 @@ describe("Engine core behavior", () => {
       applied: true,
     });
 
-    const read = await engine.execute([
-      { type: "get", collectionId: "books", id: "book-1" },
-      { type: "getAll", collectionId: "books" },
-    ] as const);
+    const read = await engine.get("books", "book-1");
+    const all = await engine.getAll("books");
 
-    expect(read[0]).toEqual({
+    expect(read).toEqual({
       namespace: TEST_NAMESPACE,
       collectionId: "books",
       id: "book-1",
@@ -123,13 +114,13 @@ describe("Engine core behavior", () => {
       hlcCounter: 0,
       hlcDeviceId: "deviceA",
     });
-    expect(read[1]).toHaveLength(1);
+    expect(all).toHaveLength(1);
   });
 
   test("delete and deleteAllWithParent create tombstones and hide rows from reads", async () => {
     const { engine } = createTestEngine();
 
-    await engine.execute([
+    await engine.batchLocal([
       { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
       {
         type: "put",
@@ -145,61 +136,35 @@ describe("Engine core behavior", () => {
         parentId: "book-1",
         data: { title: "second highlight" },
       },
-    ] as const);
+    ]);
 
-    const deleted = await engine.execute([
-      { type: "delete", collectionId: "books", id: "book-1" },
-      { type: "deleteAllWithParent", collectionId: "highlights", parentId: "book-1" },
-    ] as const);
+    const deletedBook = await engine.delete("books", "book-1");
+    const deletedChildren = await engine.deleteAllWithParent("highlights", "book-1");
 
-    expect(deleted[0]?.tombstone).toBe(true);
-    expect(deleted[1]).toHaveLength(2);
-    expect(deleted[1].every((entry) => entry.tombstone)).toBe(true);
+    expect(deletedBook.tombstone).toBe(true);
+    expect(deletedChildren).toHaveLength(2);
+    expect(deletedChildren.every((entry) => entry.tombstone)).toBe(true);
 
-    const postDelete = await engine.execute([
-      { type: "get", collectionId: "books", id: "book-1" },
-      { type: "getAllWithParent", collectionId: "highlights", parentId: "book-1" },
-      { type: "getAll", collectionId: "highlights" },
-    ] as const);
+    const book = await engine.get("books", "book-1");
+    const highlightsByParent = await engine.getAllWithParent("highlights", "book-1");
+    const highlightsAll = await engine.getAll("highlights");
 
-    expect(postDelete[0]).toBeUndefined();
-    expect(postDelete[1]).toEqual([]);
-    expect(postDelete[2]).toEqual([]);
+    expect(book).toBeUndefined();
+    expect(highlightsByParent).toEqual([]);
+    expect(highlightsAll).toEqual([]);
   });
 
   test("preserves parentId when put omits parentId", async () => {
     const { engine } = createTestEngine();
 
-    await engine.execute([
-      {
-        type: "put",
-        collectionId: "highlights",
-        id: "h-1",
-        parentId: "book-1",
-        data: { title: "first" },
-      },
-    ] as const);
+    await engine.put("highlights", "h-1", { title: "first" }, { parentId: "book-1" });
+    const update = await engine.put("highlights", "h-1", { title: "updated" });
 
-    const update = await engine.execute([
-      {
-        type: "put",
-        collectionId: "highlights",
-        id: "h-1",
-        data: { title: "updated" },
-      },
-    ] as const);
+    expect(update.parentId).toBe("book-1");
 
-    expect(update[0]?.parentId).toBe("book-1");
+    const read = await engine.get("highlights", "h-1");
 
-    const read = await engine.execute([
-      {
-        type: "get",
-        collectionId: "highlights",
-        id: "h-1",
-      },
-    ] as const);
-
-    expect(read[0]).toMatchObject({
+    expect(read).toMatchObject({
       collectionId: "highlights",
       id: "h-1",
       parentId: "book-1",
@@ -222,21 +187,12 @@ describe("Engine core behavior", () => {
     });
     const { engine } = createTestEngine({ seedRows: [existing] });
 
-    const write = await engine.execute([
-      {
-        type: "put",
-        collectionId: "books",
-        id: "book-1",
-        data: { title: "Local stale write" },
-      },
-    ] as const);
+    const write = await engine.put("books", "book-1", { title: "Local stale write" });
 
-    expect(write[0]?.applied).toBe(false);
+    expect(write.applied).toBe(false);
 
-    const read = await engine.execute([
-      { type: "get", collectionId: "books", id: "book-1" },
-    ] as const);
-    expect(read[0]).toMatchObject(existing);
+    const read = await engine.get("books", "book-1");
+    expect(read).toMatchObject(existing);
   });
 });
 
@@ -244,9 +200,7 @@ describe("Engine applyRemote", () => {
   test("applies newer remote rows and rejects older ones", async () => {
     const { engine } = createTestEngine();
 
-    await engine.execute([
-      { type: "put", collectionId: "books", id: "book-1", data: { title: "Local" } },
-    ] as const);
+    await engine.put("books", "book-1", { title: "Local" });
 
     const applied = await engine.applyRemote([
       remoteRow({
@@ -276,10 +230,8 @@ describe("Engine applyRemote", () => {
     ]);
     expect(stale.appliedCount).toBe(0);
 
-    const read = await engine.execute([
-      { type: "get", collectionId: "books", id: "book-1" },
-    ] as const);
-    expect(read[0]).toMatchObject({
+    const read = await engine.get("books", "book-1");
+    expect(read).toMatchObject({
       data: { title: "Remote update" },
       txId: "tx_remote_new",
     });
@@ -288,11 +240,11 @@ describe("Engine applyRemote", () => {
   test("tracks pending operations with sequence-based ack", async () => {
     const { engine } = createTestEngine();
 
-    await engine.execute([
+    await engine.batchLocal([
       { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
       { type: "put", collectionId: "books", id: "book-2", data: { title: "Messiah" } },
       { type: "delete", collectionId: "books", id: "book-1" },
-    ] as const);
+    ]);
 
     const pending = await engine.getPending(10);
     expect(pending).toHaveLength(3);
@@ -315,13 +267,13 @@ describe("Engine applyRemote", () => {
       );
     });
 
-    await engine.execute([{ type: "getAll", collectionId: "books" }] as const);
+    await engine.getAll("books");
     expect(events).toEqual([]);
 
-    await engine.execute([
+    await engine.batchLocal([
       { type: "put", collectionId: "books", id: "book-1", data: { title: "A" } },
       { type: "put", collectionId: "books", id: "book-1", data: { title: "B" } },
-    ] as const);
+    ]);
 
     await engine.applyRemote([
       remoteRow({

@@ -3,52 +3,47 @@ import { parseClock } from "./hlc";
 import { createSerialQueue } from "./internal/serial-queue";
 import type {
   AnyStoredRow,
+  ApplyRemoteResult,
   CollectionId,
   CollectionValueMap,
   PendingOperation,
   RowId,
   RowStorageAdapter,
   Storage,
+  StorageAtomicOperation,
   StorageChangeEvent,
   StorageInvalidationHint,
   StorageListener,
-  StorageOp,
-  StorageResult,
-  StorageResults,
+  StoragePutOptions,
   StorageWriteResult,
+  StoredRow,
 } from "./types";
 
-interface CreateEngineInput<S extends CollectionValueMap, KV extends Record<string, unknown>> {
+interface CreateEngineInput<S extends CollectionValueMap, _KV extends Record<string, unknown>> {
   adapter: RowStorageAdapter<S>;
   clock: Pick<ClockService, "nextBatch">;
   namespace: string;
   txIDFactory?: () => string;
 }
 
-interface WriteIntent<S extends CollectionValueMap> {
-  opIndex: number;
+interface LocalAtomicIntent<S extends CollectionValueMap> {
   kind: "put" | "delete";
   collectionId: CollectionId<S>;
   id: RowId;
   parentId: RowId | null;
   data: unknown | null;
+  txId?: string;
+  schemaVersion?: number;
 }
 
 export type EngineInvalidationHint<S extends CollectionValueMap> = StorageInvalidationHint<S>;
 export type EngineEvent<S extends CollectionValueMap> = StorageChangeEvent<S>;
 export type EngineListener<S extends CollectionValueMap> = StorageListener<S>;
 
-export interface ApplyRemoteResult<S extends CollectionValueMap> {
-  appliedCount: number;
-  invalidationHints: Array<EngineInvalidationHint<S>>;
-}
-
 export interface Engine<
   S extends CollectionValueMap,
   KV extends Record<string, unknown> = Record<string, unknown>,
-> extends Storage<S, KV> {
-  applyRemote(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<ApplyRemoteResult<S>>;
-}
+> extends Storage<S, KV> {}
 
 const DEFAULT_TX_ID_PREFIX = "tx";
 
@@ -125,7 +120,6 @@ export function createEngine<
 >(input: CreateEngineInput<S, KV>): Engine<S, KV> {
   const listeners = new Set<EngineListener<S>>();
   const txIDFactory = input.txIDFactory ?? defaultTxIDFactory;
-  const kvStore = new Map<string, unknown>();
   let nextPendingSequence = 1;
   const queue = createSerialQueue();
 
@@ -144,241 +138,261 @@ export function createEngine<
     }
   }
 
-  return {
-    async execute<const Ops extends readonly StorageOp<S>[]>(
-      operations: Ops,
-    ): Promise<StorageResults<S, Ops>> {
-      if (operations.length === 0) {
-        return [] as StorageResults<S, Ops>;
+  async function queryRow<C extends CollectionId<S>>(
+    collectionId: C,
+    id: RowId,
+    includeTombstones: boolean,
+  ): Promise<StoredRow<S, C> | undefined> {
+    const rows = await input.adapter.query({
+      collectionId,
+      id,
+      includeTombstones,
+    });
+    return rows[0];
+  }
+
+  async function resolveAtomicIntents(
+    operations: ReadonlyArray<StorageAtomicOperation<S>>,
+  ): Promise<LocalAtomicIntent<S>[]> {
+    const intents: LocalAtomicIntent<S>[] = [];
+
+    for (const operation of operations) {
+      switch (operation.type) {
+        case "put": {
+          let parentId = operation.parentId ?? null;
+
+          if (operation.parentId === undefined) {
+            const existing = await queryRow(operation.collectionId, operation.id, true);
+            parentId = existing?.parentId ?? null;
+          }
+
+          intents.push({
+            kind: "put",
+            collectionId: operation.collectionId,
+            id: operation.id,
+            parentId,
+            data: operation.data,
+            txId: operation.txId,
+            schemaVersion: operation.schemaVersion,
+          });
+          break;
+        }
+        case "delete": {
+          const existing = await queryRow(operation.collectionId, operation.id, true);
+          intents.push({
+            kind: "delete",
+            collectionId: operation.collectionId,
+            id: operation.id,
+            parentId: existing?.parentId ?? null,
+            data: null,
+          });
+          break;
+        }
+        default: {
+          assertNever(operation);
+        }
+      }
+    }
+
+    return intents;
+  }
+
+  async function applyLocalIntents(
+    intents: ReadonlyArray<LocalAtomicIntent<S>>,
+    defaultTxID: string,
+  ): Promise<Array<StorageWriteResult<S>>> {
+    if (intents.length === 0) {
+      return [];
+    }
+
+    const clocks = await input.clock.nextBatch(intents.length);
+    const rows: AnyStoredRow<S>[] = intents.map((intent, index) => {
+      const clock = clocks[index]!;
+      const parsed = parseClock(clock);
+
+      return {
+        namespace: input.namespace,
+        collectionId: intent.collectionId,
+        id: intent.id,
+        parentId: intent.parentId,
+        data:
+          intent.kind === "put" ? (structuredClone(intent.data) as AnyStoredRow<S>["data"]) : null,
+        tombstone: intent.kind === "delete",
+        txId: intent.txId ?? defaultTxID,
+        schemaVersion: intent.schemaVersion,
+        committedTimestampMs: parsed.wallMs,
+        hlcTimestampMs: parsed.wallMs,
+        hlcCounter: parsed.counter,
+        hlcDeviceId: parsed.nodeId,
+      };
+    });
+
+    const outcomes = await input.adapter.applyRows(rows);
+    const results: StorageWriteResult<S>[] = [];
+    const invalidationHints: Array<EngineInvalidationHint<S>> = [];
+    const pendingOperations: PendingOperation<S>[] = [];
+
+    for (let index = 0; index < outcomes.length; index += 1) {
+      const outcome = outcomes[index]!;
+      const row = rows[index]!;
+      results.push(buildWriteResult(outcome));
+
+      if (!outcome.written) {
+        continue;
       }
 
-      return queue.run(async () => {
-        const txID = txIDFactory();
-        const results: unknown[] = Array.from({ length: operations.length });
-        const writeIntents: Array<WriteIntent<S>> = [];
-        const writeIntentIndexesByOp = new Map<number, number[]>();
+      invalidationHints.push({
+        collectionId: outcome.collectionId,
+        id: outcome.id,
+        ...(outcome.parentId ? { parentId: outcome.parentId } : {}),
+      });
 
-        for (let opIndex = 0; opIndex < operations.length; opIndex += 1) {
-          const operation = operations[opIndex]!;
-
-          switch (operation.type) {
-            case "get": {
-              const row = await input.adapter.get(operation.collectionId, operation.id);
-              results[opIndex] = asLiveRow(row) as StorageResult<S, typeof operation>;
-              break;
-            }
-            case "getAll": {
-              const rows = await input.adapter.getAll(operation.collectionId);
-              results[opIndex] = asLiveRows(rows) as StorageResult<S, typeof operation>;
-              break;
-            }
-            case "getAllWithParent": {
-              const rows = await input.adapter.getAllWithParent(
-                operation.collectionId,
-                operation.parentId,
-              );
-              results[opIndex] = asLiveRows(rows) as StorageResult<S, typeof operation>;
-              break;
-            }
-            case "put": {
-              let parentId = operation.parentId ?? null;
-
-              if (operation.parentId === undefined) {
-                const existing = await input.adapter.get(operation.collectionId, operation.id);
-                parentId = existing?.parentId ?? null;
-              }
-
-              const intentIndex = writeIntents.length;
-              writeIntents.push({
-                opIndex,
-                kind: "put",
-                collectionId: operation.collectionId,
-                id: operation.id,
-                parentId,
-                data: operation.data,
-              });
-              writeIntentIndexesByOp.set(opIndex, [intentIndex]);
-              break;
-            }
-            case "delete": {
-              const existing = await input.adapter.get(operation.collectionId, operation.id);
-              const intentIndex = writeIntents.length;
-
-              writeIntents.push({
-                opIndex,
-                kind: "delete",
-                collectionId: operation.collectionId,
-                id: operation.id,
-                parentId: existing?.parentId ?? null,
-                data: null,
-              });
-              writeIntentIndexesByOp.set(opIndex, [intentIndex]);
-              break;
-            }
-            case "deleteAllWithParent": {
-              const rows = await input.adapter.getAllWithParent(
-                operation.collectionId,
-                operation.parentId,
-              );
-              const liveRows = rows.filter((row) => !row.tombstone);
-              const intentIndexes: number[] = [];
-
-              for (const row of liveRows) {
-                const intentIndex = writeIntents.length;
-                writeIntents.push({
-                  opIndex,
-                  kind: "delete",
-                  collectionId: row.collectionId,
-                  id: row.id,
-                  parentId: row.parentId,
-                  data: null,
-                });
-                intentIndexes.push(intentIndex);
-              }
-
-              writeIntentIndexesByOp.set(opIndex, intentIndexes);
-              if (intentIndexes.length === 0) {
-                results[opIndex] = [];
-              }
-              break;
-            }
-            default: {
-              assertNever(operation);
-            }
-          }
-        }
-
-        if (writeIntents.length === 0) {
-          return results as StorageResults<S, Ops>;
-        }
-
-        const clocks = await input.clock.nextBatch(writeIntents.length);
-        const rows: AnyStoredRow<S>[] = writeIntents.map((intent, index) => {
-          const clock = clocks[index]!;
-          const parsed = parseClock(clock);
-
-          return {
-            namespace: input.namespace,
-            collectionId: intent.collectionId,
-            id: intent.id,
-            parentId: intent.parentId,
-            data:
-              intent.kind === "put"
-                ? (structuredClone(intent.data) as AnyStoredRow<S>["data"])
-                : null,
-            tombstone: intent.kind === "delete",
-            txId: txID,
-            committedTimestampMs: parsed.wallMs,
-            hlcTimestampMs: parsed.wallMs,
-            hlcCounter: parsed.counter,
-            hlcDeviceId: parsed.nodeId,
-          };
+      if (row.tombstone) {
+        pendingOperations.push({
+          sequence: nextPendingSequence++,
+          type: "delete",
+          collectionId: row.collectionId,
+          id: row.id,
+          parentId: row.parentId,
+          txId: row.txId,
+          schemaVersion: row.schemaVersion,
+          hlcTimestampMs: row.hlcTimestampMs,
+          hlcCounter: row.hlcCounter,
+          hlcDeviceId: row.hlcDeviceId,
         });
+      } else {
+        pendingOperations.push({
+          sequence: nextPendingSequence++,
+          type: "put",
+          collectionId: row.collectionId,
+          id: row.id,
+          parentId: row.parentId,
+          data: structuredClone(row.data) as Exclude<typeof row.data, null>,
+          txId: row.txId,
+          schemaVersion: row.schemaVersion,
+          hlcTimestampMs: row.hlcTimestampMs,
+          hlcCounter: row.hlcCounter,
+          hlcDeviceId: row.hlcDeviceId,
+        });
+      }
+    }
 
-        const outcomes = await input.adapter.applyRows(rows);
-        const invalidationHints: Array<EngineInvalidationHint<S>> = [];
-        const pendingOperations: PendingOperation<S>[] = [];
+    if (pendingOperations.length > 0) {
+      await input.adapter.appendPending(pendingOperations);
+    }
 
-        for (let opIndex = 0; opIndex < operations.length; opIndex += 1) {
-          const operation = operations[opIndex]!;
-          const intentIndexes = writeIntentIndexesByOp.get(opIndex);
-          if (!intentIndexes) {
-            continue;
-          }
+    notify("local", uniqueInvalidationHints(invalidationHints));
+    return results;
+  }
 
-          const opWriteResults: StorageWriteResult<S>[] = [];
-
-          for (const intentIndex of intentIndexes) {
-            const outcome = outcomes[intentIndex]!;
-            const row = rows[intentIndex]!;
-            const writeResult = buildWriteResult(outcome);
-            opWriteResults.push(writeResult);
-
-            if (outcome.written) {
-              invalidationHints.push({
-                collectionId: outcome.collectionId,
-                id: outcome.id,
-                ...(outcome.parentId ? { parentId: outcome.parentId } : {}),
-              });
-
-              if (row.tombstone) {
-                pendingOperations.push({
-                  sequence: nextPendingSequence++,
-                  type: "delete",
-                  collectionId: row.collectionId,
-                  id: row.id,
-                  parentId: row.parentId,
-                  txId: row.txId,
-                  hlcTimestampMs: row.hlcTimestampMs,
-                  hlcCounter: row.hlcCounter,
-                  hlcDeviceId: row.hlcDeviceId,
-                });
-              } else {
-                pendingOperations.push({
-                  sequence: nextPendingSequence++,
-                  type: "put",
-                  collectionId: row.collectionId,
-                  id: row.id,
-                  parentId: row.parentId,
-                  data: structuredClone(row.data) as Exclude<typeof row.data, null>,
-                  txId: row.txId,
-                  hlcTimestampMs: row.hlcTimestampMs,
-                  hlcCounter: row.hlcCounter,
-                  hlcDeviceId: row.hlcDeviceId,
-                });
-              }
-            }
-          }
-
-          switch (operation.type) {
-            case "put":
-            case "delete": {
-              results[opIndex] = opWriteResults[0];
-              break;
-            }
-            case "deleteAllWithParent": {
-              results[opIndex] = opWriteResults;
-              break;
-            }
-            case "get":
-            case "getAll":
-            case "getAllWithParent": {
-              break;
-            }
-            default: {
-              assertNever(operation);
-            }
-          }
-        }
-
-        if (pendingOperations.length > 0) {
-          await input.adapter.appendPending(pendingOperations);
-        }
-
-        notify("local", uniqueInvalidationHints(invalidationHints));
-        return results as StorageResults<S, Ops>;
+  return {
+    async get<C extends CollectionId<S>>(
+      collectionId: C,
+      id: RowId,
+    ): Promise<StoredRow<S, C> | undefined> {
+      return queue.run(async () => {
+        const row = await queryRow(collectionId, id, true);
+        return asLiveRow(row as AnyStoredRow<S> | undefined) as StoredRow<S, C> | undefined;
       });
     },
 
-    async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
-      return input.adapter.getPending(limit);
+    async getAll<C extends CollectionId<S>>(collectionId: C): Promise<Array<StoredRow<S, C>>> {
+      return queue.run(async () => {
+        const rows = await input.adapter.query({
+          collectionId,
+          includeTombstones: false,
+        });
+        return asLiveRows(rows as AnyStoredRow<S>[]) as Array<StoredRow<S, C>>;
+      });
     },
 
-    async removePendingThrough(sequenceInclusive: number): Promise<void> {
-      await input.adapter.removePendingThrough(sequenceInclusive);
+    async getAllWithParent<C extends CollectionId<S>>(
+      collectionId: C,
+      parentId: RowId,
+    ): Promise<Array<StoredRow<S, C>>> {
+      return queue.run(async () => {
+        const rows = await input.adapter.query({
+          collectionId,
+          parentId,
+          includeTombstones: false,
+        });
+        return asLiveRows(rows as AnyStoredRow<S>[]) as Array<StoredRow<S, C>>;
+      });
     },
 
-    async putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void> {
-      kvStore.set(key, structuredClone(value));
+    async put<C extends CollectionId<S>>(
+      collectionId: C,
+      id: RowId,
+      data: S[C],
+      options?: StoragePutOptions,
+    ): Promise<StorageWriteResult<S, C>> {
+      return queue.run(async () => {
+        const intents = await resolveAtomicIntents([
+          {
+            type: "put",
+            collectionId,
+            id,
+            data,
+            parentId: options?.parentId,
+            txId: options?.txId,
+            schemaVersion: options?.schemaVersion,
+          },
+        ]);
+        const [result] = await applyLocalIntents(intents, txIDFactory());
+        return result as StorageWriteResult<S, C>;
+      });
     },
 
-    async getKV<Key extends keyof KV & string>(key: Key): Promise<KV[Key] | undefined> {
-      const value = kvStore.get(key);
-      return value === undefined ? undefined : (structuredClone(value) as KV[Key]);
+    async delete<C extends CollectionId<S>>(
+      collectionId: C,
+      id: RowId,
+    ): Promise<StorageWriteResult<S, C>> {
+      return queue.run(async () => {
+        const intents = await resolveAtomicIntents([{ type: "delete", collectionId, id }]);
+        const [result] = await applyLocalIntents(intents, txIDFactory());
+        return result as StorageWriteResult<S, C>;
+      });
     },
 
-    async deleteKV<Key extends keyof KV & string>(key: Key): Promise<void> {
-      kvStore.delete(key);
+    async deleteAllWithParent<C extends CollectionId<S>>(
+      collectionId: C,
+      parentId: RowId,
+    ): Promise<Array<StorageWriteResult<S, C>>> {
+      return queue.run(async () => {
+        const rows = await input.adapter.query({
+          collectionId,
+          parentId,
+          includeTombstones: false,
+        });
+        const liveRows = rows.filter((row) => !row.tombstone);
+
+        if (liveRows.length === 0) {
+          return [];
+        }
+
+        const intents: LocalAtomicIntent<S>[] = liveRows.map((row) => ({
+          kind: "delete",
+          collectionId: row.collectionId,
+          id: row.id,
+          parentId: row.parentId,
+          data: null,
+        }));
+        const results = await applyLocalIntents(intents, txIDFactory());
+        return results as Array<StorageWriteResult<S, C>>;
+      });
+    },
+
+    async batchLocal(
+      operations: ReadonlyArray<StorageAtomicOperation<S>>,
+    ): Promise<Array<StorageWriteResult<S>>> {
+      if (operations.length === 0) {
+        return [];
+      }
+
+      return queue.run(async () => {
+        const intents = await resolveAtomicIntents(operations);
+        return applyLocalIntents(intents, txIDFactory());
+      });
     },
 
     async applyRemote(rows: ReadonlyArray<AnyStoredRow<S>>): Promise<ApplyRemoteResult<S>> {
@@ -412,6 +426,27 @@ export function createEngine<
           invalidationHints: uniqueHints,
         };
       });
+    },
+
+    async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
+      return input.adapter.getPending(limit);
+    },
+
+    async removePendingThrough(sequenceInclusive: number): Promise<void> {
+      await input.adapter.removePendingThrough(sequenceInclusive);
+    },
+
+    async putKV<Key extends keyof KV & string>(key: Key, value: KV[Key]): Promise<void> {
+      await input.adapter.putKV(key, structuredClone(value));
+    },
+
+    async getKV<Key extends keyof KV & string>(key: Key): Promise<KV[Key] | undefined> {
+      const value = await input.adapter.getKV(key);
+      return value === undefined ? undefined : (structuredClone(value) as KV[Key]);
+    },
+
+    async deleteKV<Key extends keyof KV & string>(key: Key): Promise<void> {
+      await input.adapter.deleteKV(key);
     },
 
     subscribe(listener: EngineListener<S>): () => void {

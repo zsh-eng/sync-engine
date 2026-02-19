@@ -59,6 +59,7 @@ export interface CreateBunSqliteRowStoreAdapterInput {
   database?: Database;
   path?: string;
   rowsTable?: string;
+  kvTable?: string;
 }
 
 export class BunSqliteRowStoreAdapter<
@@ -75,6 +76,7 @@ export class BunSqliteRowStoreAdapter<
       userID: input.userID,
       namespace: input.namespace,
       rowsTable: input.rowsTable,
+      kvTable: input.kvTable,
     });
 
     this.database = database;
