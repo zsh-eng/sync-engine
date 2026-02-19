@@ -128,10 +128,12 @@ type PushImpl<S extends CollectionValueMap> = (
   request: TransportPushRequest<S>,
 ) => Promise<TransportPushResponse>;
 
-function createTransportHarness(input: {
-  pullImpl?: PullImpl<Collections>;
-  pushImpl?: PushImpl<Collections>;
-} = {}) {
+function createTransportHarness(
+  input: {
+    pullImpl?: PullImpl<Collections>;
+    pushImpl?: PushImpl<Collections>;
+  } = {},
+) {
   const listeners = new Set<(event: TransportEvent<Collections>) => void>();
   const pullCalls: TransportPullRequest<Collections>[] = [];
   const pushCalls: TransportPushRequest<Collections>[] = [];
@@ -146,9 +148,7 @@ function createTransportHarness(input: {
     });
   let pushImpl =
     input.pushImpl ??
-    (async (
-      request: TransportPushRequest<Collections>,
-    ): Promise<TransportPushResponse> => {
+    (async (request: TransportPushRequest<Collections>): Promise<TransportPushResponse> => {
       if (request.operations.length === 0) {
         return {};
       }
@@ -164,7 +164,9 @@ function createTransportHarness(input: {
     });
 
   const adapter: TransportAdapter<Collections> = {
-    async pull(request: TransportPullRequest<Collections>): Promise<TransportPullResponse<Collections>> {
+    async pull(
+      request: TransportPullRequest<Collections>,
+    ): Promise<TransportPullResponse<Collections>> {
       pullCalls.push(structuredClone(request));
       return pullImpl(request);
     },

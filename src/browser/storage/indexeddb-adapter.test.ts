@@ -20,8 +20,7 @@ interface Collections {
 
 const TEST_NAMESPACE = "books-app";
 
-function createIndexedDbEngine() {
-  const dbName = `row-store-test-${crypto.randomUUID()}`;
+function createIndexedDbEngine(dbName = `row-store-test-${crypto.randomUUID()}`) {
   let storedClock: HybridLogicalClock | undefined;
   let txCounter = 0;
 
@@ -52,6 +51,7 @@ function createIndexedDbEngine() {
   });
 
   return {
+    dbName,
     adapter,
     engine,
     cleanup: async () => {
@@ -153,6 +153,43 @@ describe("IndexedDbRowStoreAdapter", () => {
       expect((await adapter.getRawRow("highlights", "h-3"))?.tombstone).toBe(0);
     } finally {
       await cleanup();
+    }
+  });
+
+  test("persists pending operations across adapter instances", async () => {
+    const dbName = `row-store-test-${crypto.randomUUID()}`;
+    const first = createIndexedDbEngine(dbName);
+
+    try {
+      await first.engine.batchLocal([
+        { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+        { type: "put", collectionId: "books", id: "book-2", data: { title: "Messiah" } },
+      ]);
+
+      expect((await first.engine.getPending(10)).map((operation) => operation.sequence)).toEqual([
+        1, 2,
+      ]);
+      first.adapter.close();
+
+      const second = createIndexedDbEngine(dbName);
+      try {
+        expect((await second.engine.getPending(10)).map((operation) => operation.sequence)).toEqual(
+          [1, 2],
+        );
+
+        await second.engine.put("books", "book-3", { title: "Children of Dune" });
+        expect((await second.engine.getPending(10)).map((operation) => operation.sequence)).toEqual(
+          [1, 2, 3],
+        );
+      } finally {
+        await second.cleanup();
+      }
+    } finally {
+      try {
+        await first.cleanup();
+      } catch {
+        // Ignore: database may already be deleted by the second cleanup.
+      }
     }
   });
 });

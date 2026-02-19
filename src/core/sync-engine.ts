@@ -140,10 +140,7 @@ export function createSyncEngine<
       }
 
       const firstSequence = pending[0]!.sequence;
-      if (
-        lastFirstPendingSequence !== undefined &&
-        firstSequence <= lastFirstPendingSequence
-      ) {
+      if (lastFirstPendingSequence !== undefined && firstSequence <= lastFirstPendingSequence) {
         return;
       }
 

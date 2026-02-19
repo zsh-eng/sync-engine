@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 
 import { createEngine } from "../../core/engine";
 import {
@@ -164,6 +165,81 @@ describe("BunSqliteRowStoreAdapter", () => {
       });
     } finally {
       cleanup();
+    }
+  });
+
+  test("persists pending operations across adapter instances", async () => {
+    const database = new Database(":memory:");
+
+    let firstStoredClock: HybridLogicalClock | undefined;
+    let firstTxCounter = 0;
+    const firstClock = createClockService({
+      nodeId: "deviceA",
+      storage: {
+        read: () => firstStoredClock,
+        write: (clock) => {
+          firstStoredClock = clock;
+        },
+      },
+      now: () => 3_000,
+    });
+
+    const firstAdapter = createBunSqliteRowStoreAdapter<Collections>({
+      database,
+      userID: "user-1",
+      namespace: TEST_NAMESPACE,
+    });
+    const firstEngine = createEngine<Collections>({
+      adapter: firstAdapter,
+      clock: firstClock,
+      namespace: TEST_NAMESPACE,
+      txIDFactory: () => `tx_first_${++firstTxCounter}`,
+    });
+
+    await firstEngine.batchLocal([
+      { type: "put", collectionId: "books", id: "book-1", data: { title: "Dune" } },
+      { type: "put", collectionId: "books", id: "book-2", data: { title: "Messiah" } },
+    ]);
+    expect((await firstEngine.getPending(10)).map((operation) => operation.sequence)).toEqual([
+      1, 2,
+    ]);
+
+    let secondStoredClock: HybridLogicalClock | undefined;
+    let secondTxCounter = 0;
+    const secondClock = createClockService({
+      nodeId: "deviceA",
+      storage: {
+        read: () => secondStoredClock,
+        write: (clock) => {
+          secondStoredClock = clock;
+        },
+      },
+      now: () => 3_001,
+    });
+
+    const secondAdapter = createBunSqliteRowStoreAdapter<Collections>({
+      database,
+      userID: "user-1",
+      namespace: TEST_NAMESPACE,
+    });
+    const secondEngine = createEngine<Collections>({
+      adapter: secondAdapter,
+      clock: secondClock,
+      namespace: TEST_NAMESPACE,
+      txIDFactory: () => `tx_second_${++secondTxCounter}`,
+    });
+
+    try {
+      expect((await secondEngine.getPending(10)).map((operation) => operation.sequence)).toEqual([
+        1, 2,
+      ]);
+
+      await secondEngine.put("books", "book-3", { title: "Children of Dune" });
+      expect((await secondEngine.getPending(10)).map((operation) => operation.sequence)).toEqual([
+        1, 2, 3,
+      ]);
+    } finally {
+      secondAdapter.close();
     }
   });
 });

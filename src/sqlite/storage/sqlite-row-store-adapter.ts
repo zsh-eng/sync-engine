@@ -10,15 +10,11 @@ import type {
   StoredRow,
 } from "../../core/types";
 import { createSerialQueue } from "../../core/internal/serial-queue";
-import {
-  appendPendingOperations,
-  getPendingOperations,
-  removePendingOperationsThrough,
-  rowKey,
-} from "../../core/storage/shared";
+import { rowKey } from "../../core/storage/shared";
 
 const DEFAULT_ROWS_TABLE = "rows";
 const DEFAULT_KV_TABLE = "sync_kv";
+const DEFAULT_PENDING_TABLE = "sync_pending";
 const ROW_BIND_PARAMETER_COUNT = 12;
 const DEFAULT_MAX_ROWS_PER_STATEMENT = 90;
 
@@ -101,6 +97,7 @@ interface CreateSqliteRowStoreAdapterInput {
   namespace: string;
   rowsTable?: string;
   kvTable?: string;
+  pendingTable?: string;
   maxRowsPerStatement?: number;
 }
 
@@ -126,6 +123,20 @@ interface UpsertReturningRow {
   hlc_counter: number;
   hlc_node_id: string;
   tombstone: 0 | 1;
+}
+
+interface SqlitePendingOperationRecord {
+  sequence: number;
+  operation_type: "put" | "delete";
+  collection: string;
+  id: string;
+  parent_id: string | null;
+  value_json: string | null;
+  tx_id: string | null;
+  schema_version: number | null;
+  hlc_wall_ms: number;
+  hlc_counter: number;
+  hlc_node_id: string;
 }
 
 function toStoredRow<S extends CollectionValueMap>(row: SqliteRowRecord): AnyStoredRow<S> {
@@ -167,6 +178,51 @@ function toEncodedSqliteRow<S extends CollectionValueMap>(row: AnyStoredRow<S>):
   };
 }
 
+function toPendingOperation<S extends CollectionValueMap>(
+  record: SqlitePendingOperationRecord,
+): PendingOperation<S> {
+  const sequence = Number(record.sequence);
+  const hlcTimestampMs = Number(record.hlc_wall_ms);
+  const hlcCounter = Number(record.hlc_counter);
+
+  assertFiniteInteger(sequence, "sequence");
+  assertFiniteInteger(hlcTimestampMs, "hlc_wall_ms");
+  assertFiniteInteger(hlcCounter, "hlc_counter");
+
+  if (record.operation_type === "delete") {
+    return {
+      sequence,
+      type: "delete",
+      collectionId: record.collection as CollectionId<S>,
+      id: record.id,
+      parentId: record.parent_id,
+      txId: record.tx_id ?? undefined,
+      schemaVersion: record.schema_version ?? undefined,
+      hlcTimestampMs,
+      hlcCounter,
+      hlcDeviceId: record.hlc_node_id,
+    };
+  }
+
+  if (record.value_json === null) {
+    throw new Error("Invalid pending operation: put operation missing value_json");
+  }
+
+  return {
+    sequence,
+    type: "put",
+    collectionId: record.collection as CollectionId<S>,
+    id: record.id,
+    parentId: record.parent_id,
+    data: parseValueJson(record.value_json) as S[CollectionId<S>],
+    txId: record.tx_id ?? undefined,
+    schemaVersion: record.schema_version ?? undefined,
+    hlcTimestampMs,
+    hlcCounter,
+    hlcDeviceId: record.hlc_node_id,
+  };
+}
+
 function createRowsSchemaStatements(rowsTable: string): string[] {
   return [
     `CREATE TABLE IF NOT EXISTS ${rowsTable} (
@@ -205,15 +261,49 @@ function createKVSchemaStatements(kvTable: string): string[] {
   ];
 }
 
-function createSchemaStatements(rowsTable: string, kvTable: string): string[] {
-  return [...createRowsSchemaStatements(rowsTable), ...createKVSchemaStatements(kvTable)];
+function createPendingSchemaStatements(pendingTable: string): string[] {
+  return [
+    `CREATE TABLE IF NOT EXISTS ${pendingTable} (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      namespace TEXT NOT NULL,
+      operation_type TEXT NOT NULL CHECK (operation_type IN ('put', 'delete')),
+      collection TEXT NOT NULL,
+      id TEXT NOT NULL,
+      parent_id TEXT,
+      value_json TEXT,
+      tx_id TEXT,
+      schema_version INTEGER,
+      hlc_wall_ms INTEGER NOT NULL,
+      hlc_counter INTEGER NOT NULL,
+      hlc_node_id TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS ${pendingTable}_user_namespace_sequence_idx ON ${pendingTable} (user_id, namespace, sequence)`,
+  ];
+}
+
+function createSchemaStatements(
+  rowsTable: string,
+  kvTable: string,
+  pendingTable: string,
+): string[] {
+  return [
+    ...createRowsSchemaStatements(rowsTable),
+    ...createKVSchemaStatements(kvTable),
+    ...createPendingSchemaStatements(pendingTable),
+  ];
 }
 
 export function createSqliteRowStoreSchemaStatements(
   rowsTable = DEFAULT_ROWS_TABLE,
   kvTable = DEFAULT_KV_TABLE,
+  pendingTable = DEFAULT_PENDING_TABLE,
 ): string[] {
-  return createSchemaStatements(assertSqlIdentifier(rowsTable), assertSqlIdentifier(kvTable));
+  return createSchemaStatements(
+    assertSqlIdentifier(rowsTable),
+    assertSqlIdentifier(kvTable),
+    assertSqlIdentifier(pendingTable),
+  );
 }
 
 export class SqliteRowStoreAdapter<
@@ -224,11 +314,11 @@ export class SqliteRowStoreAdapter<
   private readonly namespace: string;
   private readonly rowsTable: string;
   private readonly kvTable: string;
+  private readonly pendingTable: string;
   private readonly selectColumns: string;
   private readonly upsertStatementHead: string;
   private readonly upsertStatementTail: string;
   private readonly maxRowsPerStatement: number;
-  private readonly pendingOperations: PendingOperation<S>[] = [];
   private readonly queue = createSerialQueue();
 
   private schemaReady: Promise<void> | undefined;
@@ -239,6 +329,7 @@ export class SqliteRowStoreAdapter<
     this.namespace = assertNamespace(input.namespace);
     this.rowsTable = assertSqlIdentifier(input.rowsTable ?? DEFAULT_ROWS_TABLE);
     this.kvTable = assertSqlIdentifier(input.kvTable ?? DEFAULT_KV_TABLE);
+    this.pendingTable = assertSqlIdentifier(input.pendingTable ?? DEFAULT_PENDING_TABLE);
     this.maxRowsPerStatement = this.resolveMaxRowsPerStatement(input.maxRowsPerStatement);
     this.selectColumns = [
       "user_id",
@@ -344,24 +435,89 @@ export class SqliteRowStoreAdapter<
   }
 
   async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
+    if (operations.length === 0) {
+      return;
+    }
+
     await this.queue.run(async () => {
-      appendPendingOperations(this.pendingOperations, operations);
+      await this.ensureSchema();
+      await this.executor.transaction(async (sql) => {
+        for (const operation of operations) {
+          const valueJson =
+            operation.type === "put" ? toValueJson(structuredClone(operation.data)) : null;
+          await sql.run(
+            `INSERT INTO ${this.pendingTable} (
+              user_id,
+              namespace,
+              operation_type,
+              collection,
+              id,
+              parent_id,
+              value_json,
+              tx_id,
+              schema_version,
+              hlc_wall_ms,
+              hlc_counter,
+              hlc_node_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              this.userID,
+              this.namespace,
+              operation.type,
+              operation.collectionId,
+              operation.id,
+              operation.parentId,
+              valueJson,
+              operation.txId ?? null,
+              operation.schemaVersion ?? null,
+              operation.hlcTimestampMs,
+              operation.hlcCounter,
+              operation.hlcDeviceId,
+            ],
+          );
+        }
+      });
     });
   }
 
   async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
     return this.queue.run(async () => {
-      return getPendingOperations(this.pendingOperations, limit);
+      await this.ensureSchema();
+      return this.executor.transaction(async (sql) => {
+        const records = await sql.all<SqlitePendingOperationRecord>(
+          `SELECT
+            sequence,
+            operation_type,
+            collection,
+            id,
+            parent_id,
+            value_json,
+            tx_id,
+            schema_version,
+            hlc_wall_ms,
+            hlc_counter,
+            hlc_node_id
+          FROM ${this.pendingTable}
+          WHERE user_id = ? AND namespace = ?
+          ORDER BY sequence ASC
+          LIMIT ?`,
+          [this.userID, this.namespace, Math.max(0, limit)],
+        );
+
+        return records.map((record) => toPendingOperation<S>(record));
+      });
     });
   }
 
   async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
     await this.queue.run(async () => {
-      this.pendingOperations.splice(
-        0,
-        this.pendingOperations.length,
-        ...removePendingOperationsThrough(this.pendingOperations, sequenceInclusive),
-      );
+      await this.ensureSchema();
+      await this.executor.transaction(async (sql) => {
+        await sql.run(
+          `DELETE FROM ${this.pendingTable} WHERE user_id = ? AND namespace = ? AND sequence <= ?`,
+          [this.userID, this.namespace, sequenceInclusive],
+        );
+      });
     });
   }
 
@@ -420,7 +576,11 @@ export class SqliteRowStoreAdapter<
   private async ensureSchema(): Promise<void> {
     if (!this.schemaReady) {
       this.schemaReady = this.executor.transaction(async (sql) => {
-        const schemaStatements = createSchemaStatements(this.rowsTable, this.kvTable);
+        const schemaStatements = createSchemaStatements(
+          this.rowsTable,
+          this.kvTable,
+          this.pendingTable,
+        );
         for (const statement of schemaStatements) {
           await sql.run(statement);
         }

@@ -1,11 +1,6 @@
 import Dexie, { type Table } from "dexie";
 
-import {
-  appendPendingOperations,
-  compareHlc,
-  getPendingOperations,
-  removePendingOperationsThrough,
-} from "../../core/storage/shared";
+import { compareHlc } from "../../core/storage/shared";
 import type {
   AnyStoredRow,
   CollectionId,
@@ -38,9 +33,27 @@ export interface IndexedDbKVRecord {
   value: unknown;
 }
 
+export interface IndexedDbPendingOperationRecord<
+  S extends CollectionValueMap = Record<string, unknown>,
+> {
+  sequence?: number;
+  namespace: string;
+  operationType: "put" | "delete";
+  collectionId: CollectionId<S>;
+  id: string;
+  parentId: string | null;
+  data: unknown | null;
+  txId: string | null;
+  schemaVersion: number | null;
+  hlcTimestampMs: number;
+  hlcCounter: number;
+  hlcDeviceId: string;
+}
+
 class RowStoreDexieDatabase<S extends CollectionValueMap = Record<string, unknown>> extends Dexie {
   readonly rows!: Table<IndexedDbRowRecord<S>, [string, string, string]>;
   readonly kv!: Table<IndexedDbKVRecord, [string, string]>;
+  readonly pending!: Table<IndexedDbPendingOperationRecord<S>, number>;
 
   constructor(
     name: string,
@@ -54,6 +67,12 @@ class RowStoreDexieDatabase<S extends CollectionValueMap = Record<string, unknow
     this.version(1).stores({
       rows: "&[namespace+collectionId+id], [namespace+collectionId], [namespace+collectionId+parentId], [namespace+collectionId+tombstone], [namespace+committedTimestampMs+collectionId+id], [namespace+hlcTimestampMs+hlcCounter+hlcDeviceId]",
       kv: "&[namespace+key]",
+    });
+
+    this.version(2).stores({
+      rows: "&[namespace+collectionId+id], [namespace+collectionId], [namespace+collectionId+parentId], [namespace+collectionId+tombstone], [namespace+committedTimestampMs+collectionId+id], [namespace+hlcTimestampMs+hlcCounter+hlcDeviceId]",
+      kv: "&[namespace+key]",
+      pending: "++sequence, [namespace+sequence]",
     });
   }
 }
@@ -101,6 +120,82 @@ function toIndexedDbRow<S extends CollectionValueMap>(
   };
 }
 
+function toPendingRecord<S extends CollectionValueMap>(
+  namespace: string,
+  operation: PendingOperation<S>,
+): IndexedDbPendingOperationRecord<S> {
+  if (operation.type === "delete") {
+    return {
+      namespace,
+      operationType: "delete",
+      collectionId: operation.collectionId,
+      id: operation.id,
+      parentId: operation.parentId,
+      data: null,
+      txId: operation.txId ?? null,
+      schemaVersion: operation.schemaVersion ?? null,
+      hlcTimestampMs: operation.hlcTimestampMs,
+      hlcCounter: operation.hlcCounter,
+      hlcDeviceId: operation.hlcDeviceId,
+    };
+  }
+
+  return {
+    namespace,
+    operationType: "put",
+    collectionId: operation.collectionId,
+    id: operation.id,
+    parentId: operation.parentId,
+    data: structuredClone(operation.data),
+    txId: operation.txId ?? null,
+    schemaVersion: operation.schemaVersion ?? null,
+    hlcTimestampMs: operation.hlcTimestampMs,
+    hlcCounter: operation.hlcCounter,
+    hlcDeviceId: operation.hlcDeviceId,
+  };
+}
+
+function toPendingOperation<S extends CollectionValueMap>(
+  record: IndexedDbPendingOperationRecord<S>,
+): PendingOperation<S> {
+  if (record.sequence === undefined) {
+    throw new Error("Invalid pending operation: missing sequence");
+  }
+
+  if (record.operationType === "delete") {
+    return {
+      sequence: record.sequence,
+      type: "delete",
+      collectionId: record.collectionId,
+      id: record.id,
+      parentId: record.parentId,
+      txId: record.txId ?? undefined,
+      schemaVersion: record.schemaVersion ?? undefined,
+      hlcTimestampMs: record.hlcTimestampMs,
+      hlcCounter: record.hlcCounter,
+      hlcDeviceId: record.hlcDeviceId,
+    };
+  }
+
+  if (record.data === null) {
+    throw new Error("Invalid pending operation: put operation missing data");
+  }
+
+  return {
+    sequence: record.sequence,
+    type: "put",
+    collectionId: record.collectionId,
+    id: record.id,
+    parentId: record.parentId,
+    data: structuredClone(record.data) as S[CollectionId<S>],
+    txId: record.txId ?? undefined,
+    schemaVersion: record.schemaVersion ?? undefined,
+    hlcTimestampMs: record.hlcTimestampMs,
+    hlcCounter: record.hlcCounter,
+    hlcDeviceId: record.hlcDeviceId,
+  };
+}
+
 export interface CreateIndexedDbRowStoreAdapterInput {
   dbName: string;
   namespace: string;
@@ -113,7 +208,6 @@ export class IndexedDbRowStoreAdapter<
 > implements RowStorageAdapter<S> {
   private readonly db: RowStoreDexieDatabase<S>;
   private readonly namespace: string;
-  private pendingOperations: PendingOperation<S>[] = [];
 
   constructor(input: CreateIndexedDbRowStoreAdapterInput) {
     const hasCustomIndexedDb = input.indexedDB !== undefined || input.IDBKeyRange !== undefined;
@@ -226,18 +320,31 @@ export class IndexedDbRowStoreAdapter<
   }
 
   async appendPending(operations: ReadonlyArray<PendingOperation<S>>): Promise<void> {
-    appendPendingOperations(this.pendingOperations, operations);
+    if (operations.length === 0) {
+      return;
+    }
+
+    await this.db.transaction("rw", this.db.pending, async () => {
+      await this.db.pending.bulkAdd(
+        operations.map((operation) => toPendingRecord(this.namespace, operation)),
+      );
+    });
   }
 
   async getPending(limit: number): Promise<Array<PendingOperation<S>>> {
-    return getPendingOperations(this.pendingOperations, limit);
+    const records = await this.db.pending
+      .where("[namespace+sequence]")
+      .between([this.namespace, Dexie.minKey], [this.namespace, Dexie.maxKey], true, true)
+      .limit(Math.max(0, limit))
+      .toArray();
+    return records.map((record) => toPendingOperation(record));
   }
 
   async removePendingThrough(sequenceInclusive: PendingSequence): Promise<void> {
-    this.pendingOperations = removePendingOperationsThrough(
-      this.pendingOperations,
-      sequenceInclusive,
-    );
+    await this.db.pending
+      .where("[namespace+sequence]")
+      .between([this.namespace, Dexie.minKey], [this.namespace, sequenceInclusive], true, true)
+      .delete();
   }
 
   async putKV(key: string, value: unknown): Promise<void> {

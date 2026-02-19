@@ -91,6 +91,7 @@ export interface CreateD1SqliteRowStoreAdapterInput {
   namespace: string;
   rowsTable?: string;
   kvTable?: string;
+  pendingTable?: string;
 }
 
 export class D1SqliteRowStoreAdapter<
@@ -107,6 +108,7 @@ export class D1SqliteRowStoreAdapter<
       namespace: input.namespace,
       rowsTable: input.rowsTable,
       kvTable: input.kvTable,
+      pendingTable: input.pendingTable,
     });
 
     this.database = input.database;

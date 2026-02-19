@@ -196,7 +196,7 @@ describe("D1SqliteRowStoreAdapter", () => {
         tombstone: 1,
       });
 
-      expect(database.batchSizes).toContain(8);
+      expect(database.batchSizes).toContain(10);
     } finally {
       cleanup();
     }
