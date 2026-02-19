@@ -1,45 +1,55 @@
-import type { ConnectionManager } from "../../core/connection/connection-manager";
+import type { ConnectionDriver, ConnectionState } from "../../core/types";
 
-export interface BrowserBindingsInput {
-  manager: ConnectionManager;
+export interface CreateBrowserConnectionDriverInput {
   /** Injectable window for testing. Defaults to globalThis.window. */
   window?: Window;
 }
 
 /**
- * Wire browser events (online/offline, visibilitychange) to a ConnectionManager.
- * Auth is intentionally NOT wired here — it's app-specific.
- * Returns a cleanup function that removes all event listeners.
+ * Build a browser ConnectionDriver from network + visibility signals.
+ * Auth is intentionally not inferred from browser primitives.
  */
-export function bindBrowserEvents(input: BrowserBindingsInput): () => void {
+export function createBrowserConnectionDriver(
+  input: CreateBrowserConnectionDriverInput = {},
+): ConnectionDriver {
   const win = input.window ?? window;
-  const { manager } = input;
 
-  const handleOnline = () => manager.setOnline();
-  const handleOffline = () => manager.setOffline();
-  const handleVisibility = () => {
-    if (win.document.hidden) {
-      manager.setHidden();
-    } else {
-      manager.setVisible();
+  function deriveState(): ConnectionState {
+    if (!win.navigator.onLine) {
+      return "offline";
     }
-  };
 
-  // Sync initial state
-  if (!win.navigator.onLine) {
-    manager.setOffline();
-  }
-  if (win.document.hidden) {
-    manager.setHidden();
+    if (win.document.hidden) {
+      return "paused";
+    }
+
+    return "connected";
   }
 
-  win.addEventListener("online", handleOnline);
-  win.addEventListener("offline", handleOffline);
-  win.document.addEventListener("visibilitychange", handleVisibility);
+  return {
+    subscribe(listener: (state: ConnectionState) => void): () => void {
+      let current = deriveState();
+      listener(current);
 
-  return () => {
-    win.removeEventListener("online", handleOnline);
-    win.removeEventListener("offline", handleOffline);
-    win.document.removeEventListener("visibilitychange", handleVisibility);
+      const emitIfChanged = () => {
+        const next = deriveState();
+        if (next === current) {
+          return;
+        }
+
+        current = next;
+        listener(next);
+      };
+
+      win.addEventListener("online", emitIfChanged);
+      win.addEventListener("offline", emitIfChanged);
+      win.document.addEventListener("visibilitychange", emitIfChanged);
+
+      return () => {
+        win.removeEventListener("online", emitIfChanged);
+        win.removeEventListener("offline", emitIfChanged);
+        win.document.removeEventListener("visibilitychange", emitIfChanged);
+      };
+    },
   };
 }

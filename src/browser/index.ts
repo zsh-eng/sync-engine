@@ -10,4 +10,7 @@ export {
   IndexedDbRowStoreAdapter,
 } from "./storage/indexeddb-adapter";
 
-export { bindBrowserEvents, type BrowserBindingsInput } from "./connection/browser-bindings";
+export {
+  createBrowserConnectionDriver,
+  type CreateBrowserConnectionDriverInput,
+} from "./connection/browser-bindings";

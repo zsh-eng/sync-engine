@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import { bindBrowserEvents } from "./browser-bindings";
-import { createConnectionManager } from "../../core/connection/connection-manager";
+import { createBrowserConnectionDriver } from "./browser-bindings";
+import { createConnectionManager } from "../../core/connection";
+import type { ConnectionState } from "../../core/types";
 
 function createMockWindow(opts: { online?: boolean; hidden?: boolean } = {}) {
   const listeners: Record<string, Set<EventListener>> = {};
@@ -43,93 +44,119 @@ function createMockWindow(opts: { online?: boolean; hidden?: boolean } = {}) {
   return { win, dispatch, dispatchDoc, docListeners, listeners };
 }
 
-describe("bindBrowserEvents", () => {
-  test("dispatching offline event calls setOffline", () => {
-    const manager = createConnectionManager();
-    const { win, dispatch } = createMockWindow();
-    bindBrowserEvents({ manager, window: win });
+describe("createBrowserConnectionDriver", () => {
+  function subscribeToDriver(driver: ReturnType<typeof createBrowserConnectionDriver>): {
+    states: ConnectionState[];
+    unsubscribe: () => void;
+  } {
+    const states: ConnectionState[] = [];
+    const unsubscribe = driver.subscribe((state) => states.push(state));
+    return { states, unsubscribe };
+  }
 
+  test("emits initial connected when online and visible", () => {
+    const { win } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
+
+    expect(states).toEqual(["connected"]);
+    unsubscribe();
+  });
+
+  test("emits initial offline when navigator is offline", () => {
+    const { win } = createMockWindow({ online: false, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
+
+    expect(states).toEqual(["offline"]);
+    unsubscribe();
+  });
+
+  test("emits initial paused when online and hidden", () => {
+    const { win } = createMockWindow({ online: true, hidden: true });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
+
+    expect(states).toEqual(["paused"]);
+    unsubscribe();
+  });
+
+  test("offline event transitions to offline", () => {
+    const { win, dispatch } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
+
+    (win.navigator as { onLine: boolean }).onLine = false;
     dispatch("offline");
-    expect(manager.getState().network).toBe("offline");
+
+    expect(states).toEqual(["connected", "offline"]);
+    unsubscribe();
   });
 
-  test("dispatching online event calls setOnline", () => {
-    const manager = createConnectionManager({ initialNetwork: "offline" });
-    const { win, dispatch } = createMockWindow();
-    bindBrowserEvents({ manager, window: win });
+  test("online event transitions from offline to connected", () => {
+    const { win, dispatch } = createMockWindow({ online: false, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
 
+    (win.navigator as { onLine: boolean }).onLine = true;
     dispatch("online");
-    expect(manager.getState().network).toBe("online");
+
+    expect(states).toEqual(["offline", "connected"]);
+    unsubscribe();
   });
 
-  test("syncs initial navigator.onLine = false at bind time", () => {
-    const manager = createConnectionManager();
-    const { win } = createMockWindow({ online: false });
-    bindBrowserEvents({ manager, window: win });
-
-    expect(manager.getState().network).toBe("offline");
-  });
-
-  test("does not change network if navigator.onLine = true at bind time", () => {
-    const manager = createConnectionManager();
-    const calls: unknown[] = [];
-    manager.subscribe((state) => calls.push(state));
-
-    const { win } = createMockWindow({ online: true });
-    bindBrowserEvents({ manager, window: win });
-
-    // No notification because initial state is already online
-    expect(calls).toHaveLength(0);
-    expect(manager.getState().network).toBe("online");
-  });
-
-  test("syncs initial document.hidden = true at bind time", () => {
-    const manager = createConnectionManager();
-    const { win } = createMockWindow({ hidden: true });
-    bindBrowserEvents({ manager, window: win });
-
-    expect(manager.getState().visibility).toBe("hidden");
-  });
-
-  test("visibilitychange with document.hidden = true calls setHidden", () => {
-    const manager = createConnectionManager();
-    const { win, dispatchDoc } = createMockWindow();
-    bindBrowserEvents({ manager, window: win });
+  test("visibilitychange transitions between connected and paused", () => {
+    const { win, dispatchDoc } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
 
     (win.document as { hidden: boolean }).hidden = true;
     dispatchDoc("visibilitychange");
-    expect(manager.getState().visibility).toBe("hidden");
-  });
-
-  test("visibilitychange with document.hidden = false calls setVisible", () => {
-    const manager = createConnectionManager({ initialVisibility: "hidden" });
-    const { win, dispatchDoc } = createMockWindow({ hidden: true });
-    bindBrowserEvents({ manager, window: win });
-
     (win.document as { hidden: boolean }).hidden = false;
     dispatchDoc("visibilitychange");
-    expect(manager.getState().visibility).toBe("visible");
+
+    expect(states).toEqual(["connected", "paused", "connected"]);
+    unsubscribe();
   });
 
-  test("cleanup removes all event listeners", () => {
-    const manager = createConnectionManager();
-    const { win, dispatch, dispatchDoc, listeners, docListeners } = createMockWindow();
-    const cleanup = bindBrowserEvents({ manager, window: win });
+  test("does not emit duplicate state changes", () => {
+    const { win, dispatch } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const { states, unsubscribe } = subscribeToDriver(driver);
 
-    // Verify listeners were added
+    dispatch("online");
+    dispatch("online");
+
+    expect(states).toEqual(["connected"]);
+    unsubscribe();
+  });
+
+  test("unsubscribe removes all browser listeners", () => {
+    const { win, listeners, docListeners } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const unsubscribe = driver.subscribe(() => {});
+
     expect(listeners["online"]?.size).toBe(1);
     expect(listeners["offline"]?.size).toBe(1);
     expect(docListeners["visibilitychange"]?.size).toBe(1);
 
-    cleanup();
+    unsubscribe();
 
-    // Verify listeners were removed
     expect(listeners["online"]?.size).toBe(0);
     expect(listeners["offline"]?.size).toBe(0);
     expect(docListeners["visibilitychange"]?.size).toBe(0);
+  });
 
-    // Events after cleanup have no effect
-    dispatch("offline");
-    expect(manager.getState().network).toBe("online");
+  test("works with createConnectionManager integration", () => {
+    const { win, dispatchDoc } = createMockWindow({ online: true, hidden: false });
+    const driver = createBrowserConnectionDriver({ window: win });
+    const manager = createConnectionManager({ driver });
+
+    expect(manager.getState()).toBe("connected");
+
+    (win.document as { hidden: boolean }).hidden = true;
+    dispatchDoc("visibilitychange");
+
+    expect(manager.getState()).toBe("paused");
   });
 });
